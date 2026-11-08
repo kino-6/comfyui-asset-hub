@@ -2,12 +2,15 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import threading
+import io
+import struct
+import zlib
 import unittest
 from unittest.mock import patch
 
 from PIL import Image
 
-from disk_space import DiskReservations, requirements, volume
+from disk_space import DiskReservations, requirements, volume, png_budget
 from job_store import JobStore
 from jobs import run_parallel
 from storage import Storage
@@ -71,6 +74,46 @@ class ReuseTests(unittest.TestCase):
 
 
 class SpaceTests(unittest.TestCase):
+    def test_fragmented_png_scan_is_sequential_and_keeps_metadata_budget(self):
+        def chunk(kind, data):
+            return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'fragmented.png'
+            ordinary = Path(temp) / 'ordinary.png'
+            Image.new('RGB', (512, 512), '#123456').save(ordinary, compress_level=0)
+            original = ordinary.read_bytes()
+            pos, idat = 8, b''
+            while pos < len(original):
+                length = int.from_bytes(original[pos:pos+4], 'big')
+                if original[pos+4:pos+8] == b'IDAT':
+                    idat += original[pos+8:pos+8+length]
+                pos += length + 12
+            tail = chunk(b'tEXt', b'Comment\0' + b'x' * 8192)
+            path.write_bytes(original[:33] + b''.join(chunk(b'IDAT', idat[i:i+512]) for i in range(0, len(idat), 512)) + tail + chunk(b'IEND', b''))
+            counters = dict(read=0, seek=0)
+            class Raw(io.FileIO):
+                def readinto(self, buffer):
+                    counters['read'] += 1
+                    return super().readinto(buffer)
+                def seek(self, *args):
+                    counters['seek'] += 1
+                    return super().seek(*args)
+            def open_scan(name, mode, buffering=-1):
+                return io.BufferedReader(Raw(name, mode), buffer_size=buffering)
+            with patch('disk_space.open', open_scan, create=True):
+                budget, metadata = png_budget(path)
+            self.assertEqual(metadata, len(tail) * 2 + 1024**2)
+            self.assertEqual(budget, int(512 * 512 * 4 * 1.1) + metadata)
+            self.assertEqual(counters['seek'], 0)
+            self.assertLessEqual(counters['read'], 2)
+            # Animation and truncated trailing chunks must still be rejected.
+            path.write_bytes(path.read_bytes()[:-12] + chunk(b'acTL', struct.pack('>II', 2, 0)) + chunk(b'IEND', b''))
+            with self.assertRaisesRegex(ValueError, 'アニメーション'):
+                png_budget(path)
+            path.write_bytes(original[:-12] + struct.pack('>I', 100) + b'tEXt' + b'cut')
+            with self.assertRaisesRegex(ValueError, '途中'):
+                png_budget(path)
+
     def test_same_volume_sums_stage_and_destination_and_limits_parallelism(self):
         free = [100]
         disk = DiskReservations(lambda _: [('stage', 30), ('destination', 30)], space=lambda _: SimpleNamespace(free=free[0]),

@@ -2,6 +2,8 @@ import importlib.util
 from pathlib import Path
 import threading
 import unittest
+from unittest.mock import patch
+from concurrent.futures import Future
 from work_progress import report, reporter
 
 spec = importlib.util.spec_from_file_location('hub_jobs_test', Path(__file__).resolve().parents[1] / 'jobs.py')
@@ -44,6 +46,28 @@ class ParallelTests(unittest.TestCase):
 
     def job(self):
         return dict(done=0, succeeded=0, error_count=0, errors=[], results=[])
+
+    def test_completed_images_are_checkpointed_before_filling_all_slots(self):
+        checkpointed = threading.Event()
+        def items():
+            yield 0
+            # A slow admission must not postpone all checkpoints until 16 fills.
+            self.assertTrue(checkpointed.is_set())
+            yield 1
+            yield 2
+        class ImmediatePool:
+            def __init__(self, **kwargs): pass
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def submit(self, function, *args):
+                future = Future()
+                future.set_result(function(*args))
+                return future
+        job = self.job()
+        with patch.object(module, 'ThreadPoolExecutor', ImmediatePool):
+            module.run_parallel(job, items(), lambda item: item, threading.Event(), 16,
+                                completed=lambda item, *_: checkpointed.set() if item == 0 else None)
+        self.assertEqual(job['done'], 3)
 
     def test_parallel_workers_overlap_and_one_error_does_not_stop_others(self):
         barrier = threading.Barrier(4)

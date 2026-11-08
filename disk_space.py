@@ -11,6 +11,7 @@ from PIL import Image
 
 MIB = 1024 * 1024
 HEADROOM = 64 * MIB
+PNG_SCAN_BUFFER = MIB
 
 
 def volume(path):
@@ -35,7 +36,11 @@ def volume(path):
 
 
 def png_budget(path):
-    """Read dimensions/metadata, without decoding the image's pixels."""
+    """Read dimensions/metadata without decoding pixels or seeking per PNG chunk.
+
+    Small read/seek pairs serialize admission and are costly on slower volumes.
+    Consume IDAT in bounded, sequential buffers so the OS can read ahead.
+    """
     with Image.open(path) as image:
         width, height = image.size
         if image.format != 'PNG' or image.mode not in ('RGB', 'RGBA') or max(width, height) > 16383:
@@ -43,28 +48,41 @@ def png_budget(path):
         metadata = sum(len(value.encode('utf-8')) if isinstance(value, str) else len(value) if isinstance(value, bytes) else 0
                        for value in image.info.values())
     ancillary = 0
-    with open(path, 'rb') as stream:
+    with open(path, 'rb', buffering=PNG_SCAN_BUFFER) as stream:
         if stream.read(8) != b'\x89PNG\r\n\x1a\n':
             raise ValueError('PNGではありません。')
-        length = path.stat().st_size
-        while stream.tell() + 12 <= length:
+        length = os.fstat(stream.fileno()).st_size
+        position = 8
+        while position + 12 <= length:
             header = stream.read(8)
+            if len(header) != 8:
+                raise ValueError('PNGが途中で切れています。')
             count = int.from_bytes(header[:4], 'big')
-            if stream.tell() + count + 4 > length:
+            position += count + 12
+            if position > length:
                 raise ValueError('PNGが途中で切れています。')
             if header[4:] == b'acTL':
                 raise ValueError('アニメーションPNGは対象外です。')
             if header[4:] == b'IHDR':
-                data = stream.read(count)
-                if count != 13 or data[8] != 8 or data[9] not in (2, 6):
+                if count != 13:
                     raise ValueError('圧縮対象外の画像です。')
-                stream.seek(4, 1)
-                continue
+                data = stream.read(count)
+                if len(data) != 13 or data[8] != 8 or data[9] not in (2, 6):
+                    raise ValueError('圧縮対象外の画像です。')
+                remaining = 4
+            else:
+                remaining = count + 4
             if header[4:] not in (b'IDAT', b'IHDR', b'IEND'):
                 ancillary += count + 12
-            stream.seek(count + 4, 1)
+            while remaining:
+                block = stream.read(min(remaining, PNG_SCAN_BUFFER))
+                if not block:
+                    raise ValueError('PNGが途中で切れています。')
+                remaining -= len(block)
             if header[4:] == b'IEND':
                 break
+        else:
+            raise ValueError('PNGが途中で切れています。')
     metadata = max(metadata * 3, ancillary * 2) + MIB
     return int(width * height * 4 * 1.1) + metadata, metadata
 

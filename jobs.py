@@ -24,6 +24,7 @@ def run_parallel(job, items, process, cancel, workers, limit=None, completed=Non
         with ThreadPoolExecutor(max_workers=16, thread_name_prefix='asset-hub') as pool:
             active = {}
             while active or not exhausted:
+                admission_waiting = False
                 capacity = max(0, min(16, job['workers'], limit() if limit else job['workers']))
                 job['active_limit'] = capacity
                 while not exhausted and len(active) < capacity and not cancel.is_set():
@@ -38,6 +39,7 @@ def run_parallel(job, items, process, cancel, workers, limit=None, completed=Non
                         previous_reason = admission.reason if admission else ''
                         if admission and not admission.acquire(item):
                             job['wait_reason'] = admission.reason
+                            admission_waiting = True
                             break
                         if previous_reason and job.get('wait_reason') == previous_reason:
                             job['wait_reason'] = ''
@@ -48,6 +50,10 @@ def run_parallel(job, items, process, cancel, workers, limit=None, completed=Non
                         future = pool.submit(progress.run, process, item)
                     active[future] = item
                     pending_item = unset
+                    # Check completed work and publish progress between admissions.
+                    # Filling all 16 slots first can hide completions for seconds
+                    # when a folder iterator or space preflight performs slow I/O.
+                    break
                 job['running'] = [item['value'] if isinstance(item, dict) and '_task_seq' in item else item for item in active.values()]
                 job['progress'] = progress.snapshot()
                 if cancel.is_set():
@@ -57,7 +63,8 @@ def run_parallel(job, items, process, cancel, workers, limit=None, completed=Non
                         break
                     cancel.wait(.25)
                     continue
-                finished, _ = wait(active, return_when=FIRST_COMPLETED, timeout=0.2)
+                can_submit = not exhausted and not cancel.is_set() and not admission_waiting and len(active) < capacity
+                finished, _ = wait(active, return_when=FIRST_COMPLETED, timeout=0 if can_submit else 0.2)
                 for future in finished:
                     item = active.pop(future)
                     if admission:
