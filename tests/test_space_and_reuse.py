@@ -1,0 +1,146 @@
+from pathlib import Path
+from types import SimpleNamespace
+import tempfile
+import threading
+import unittest
+from unittest.mock import patch
+
+from PIL import Image
+
+from disk_space import DiskReservations, requirements, volume
+from job_store import JobStore
+from jobs import run_parallel
+from storage import Storage
+import native_webp
+
+
+class ReuseTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.item = dict(type='output', subfolder='', name='tiny.png')
+        self.source = self.root / 'tiny.png'
+        Image.new('RGB', (8, 8), '#112233').save(self.source)
+        self.store = Storage(self.root / 'state', lambda item: self.root / item['name'])
+
+    def test_result_survives_restart_and_skips_native_encoder(self):
+        before = self.source.read_bytes()
+        result = self.store.archive(self.item)
+        self.assertEqual(result['state'], 'not_smaller')
+        self.assertEqual(self.source.read_bytes(), before)
+        self.assertEqual(list(self.store.stage.iterdir()), [])
+        reopened = Storage(self.root / 'state', self.store.resolve)
+        with patch.object(native_webp, 'encode', side_effect=AssertionError('must not encode again')):
+            again = reopened.archive(self.item)
+        self.assertEqual(again['id'], result['id'])
+        self.assertTrue(again['skipped'])
+        plan = reopened.selection_targets([self.item])
+        self.assertEqual(plan['archive'], [])
+        self.assertEqual(plan['unchanged'], 1)
+        self.assertEqual(requirements(reopened, 'archive', self.item), [])
+
+    def test_changed_image_and_changed_engine_are_reevaluated(self):
+        first = self.store.archive(self.item)
+        Image.new('RGB', (9, 9), '#446688').save(self.source)
+        self.assertEqual(self.store.selection_targets([self.item])['archive'], [self.item])
+        second = self.store.archive(self.item)
+        self.assertNotEqual(first['source_hash'], second['source_hash'])
+        self.store.encoder_key += '-updated-engine'
+        self.assertEqual(self.store.selection_targets([self.item])['archive'], [self.item])
+        third = self.store.archive(self.item)
+        self.assertNotEqual(third['id'], second['id'])
+        self.assertEqual(third['encoder_key'], self.store.encoder_key)
+
+    def test_manual_candidate_discard_is_not_a_no_saving_result(self):
+        Image.new('RGB', (256, 256)).save(self.source, compress_level=0)
+        prepared = self.store.prepare(self.item)
+        self.assertGreater(prepared['saving_bytes'], 0)
+        self.store.discard(prepared['id'])
+        self.assertEqual(self.store.selection_targets([self.item])['archive'], [self.item])
+
+    def test_job_checkpoint_counts_retained_originals_after_restart(self):
+        ledger = JobStore(self.root / 'jobs.sqlite3')
+        job = ledger.create('archive', [self.item], 1, True, lambda _: None)
+        run_parallel(job, ledger.items(job['id']), lambda task: self.store.public(self.store.archive(task['value'])), threading.Event(), 1,
+                     completed=lambda task, result, error: ledger.complete(job['id'], task, result, error))
+        ledger.state(job['id'], 'done')
+        recovered = JobStore(ledger.path).get(job['id'])
+        self.assertEqual((recovered['done'], recovered['skipped'], recovered['not_smaller']), (1, 1, 1))
+        self.assertEqual(recovered['remaining'], 0)
+
+
+class SpaceTests(unittest.TestCase):
+    def test_same_volume_sums_stage_and_destination_and_limits_parallelism(self):
+        free = [100]
+        disk = DiskReservations(lambda _: [('stage', 30), ('destination', 30)], space=lambda _: SimpleNamespace(free=free[0]),
+                                identify=lambda path: ('same-volume', path), headroom=10)
+        a, b = {}, {}
+        self.assertTrue(disk.acquire(a))
+        self.assertFalse(disk.acquire(b))
+        self.assertIn('空き容量', disk.reason)
+        disk.release(a)
+        self.assertTrue(disk.acquire(b))
+        disk.release(b)
+        self.assertEqual(disk.held, {})
+
+    def test_different_volumes_both_require_space(self):
+        free = {'stage': 100, 'destination': 20}
+        disk = DiskReservations(lambda _: [('stage', 30), ('destination', 30)], space=lambda path: SimpleNamespace(free=free[path]),
+                                identify=lambda path: (path, path), headroom=10)
+        task = {}
+        self.assertFalse(disk.acquire(task))
+        free['destination'] = 50
+        self.assertTrue(disk.acquire(task))
+
+    def test_wait_then_resume_and_release_when_processing_fails(self):
+        free, seen = [0], threading.Event()
+        job = dict(done=0, succeeded=0, error_count=0, errors=[], results=[], total=1)
+        disk = DiskReservations(lambda _: [('target', 30)], space=lambda _: (seen.set() or SimpleNamespace(free=free[0])),
+                                identify=lambda path: (path, path), headroom=10)
+        def fail(_):
+            raise ValueError('broken')
+        worker = threading.Thread(target=run_parallel, args=(job, [{}], fail, threading.Event(), 1), kwargs={'admission': disk})
+        worker.start()
+        self.assertTrue(seen.wait(3))
+        self.assertEqual(job['done'], 0)
+        free[0] = 100
+        worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(job['error_count'], 1)
+        self.assertEqual(disk.held, {})
+
+    def test_space_wait_can_pause_without_losing_durable_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = JobStore(Path(directory) / 'jobs.sqlite3')
+            job = ledger.create('archive', [{'name': 'a'}], 1, True, lambda _: None)
+            stop, waiting = threading.Event(), threading.Event()
+            disk = DiskReservations(lambda _: [('target', 30)], space=lambda _: (waiting.set() or SimpleNamespace(free=0)),
+                                    identify=lambda path: (path, path), headroom=10)
+            worker = threading.Thread(target=run_parallel, args=(job, ledger.items(job['id']), lambda _: self.fail('must not run'), stop, 1), kwargs={'admission': disk})
+            worker.start()
+            self.assertTrue(waiting.wait(3))
+            stop.set()
+            worker.join(3)
+            ledger.state(job['id'], 'paused')
+            self.assertEqual(ledger.resume(job['id'], False, lambda _: None)['remaining'], 1)
+            self.assertEqual(disk.held, {})
+
+    def test_planner_includes_stage_and_output_and_restore_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source.png'
+            Image.new('RGB', (256, 256)).save(source, compress_level=0)
+            store = Storage(root / 'state', lambda item: source)
+            item = dict(type='output', subfolder='', name='source.png')
+            plan = requirements(store, 'archive', item)
+            self.assertEqual([p for p, _ in plan], [store.stage, root])
+            self.assertTrue(all(n > 256*256*4 for _, n in plan))
+            prepared = store.prepare(item)
+            restore = requirements(store, 'restore', prepared['id'])
+            self.assertEqual([p for p, _ in restore], [store.cache, root])
+            self.assertEqual(volume(root)[0], volume(store.stage)[0])
+
+
+if __name__ == '__main__':
+    unittest.main()

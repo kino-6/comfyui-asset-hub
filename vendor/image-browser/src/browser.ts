@@ -1,0 +1,4939 @@
+// browser.ts — the full-canvas image browser view.
+//
+// Reuses the card-grid file-explorer pattern proven in comfyui-gallery-loader's
+// image-picker (breadcrumbs, thumbnail grid, lazy-load, sort, fuzzy search), but
+// as a STANDALONE full-viewport view launched from the app chrome rather than a
+// per-widget modal — and it MANAGES files (delete / rename / move) instead of
+// committing a value to a node widget.
+
+import type {
+  MetaRow,
+  ModalShellController,
+  RatingAddress,
+  SafeViewConfig,
+  SafeViewTarget,
+  ViewMode,
+} from "@laurigates/comfy-modal-kit";
+import {
+  applyStars,
+  confirmInShell,
+  copyTextToClipboard,
+  createScrollMemory,
+  createViewStore,
+  ensureStyleOnce,
+  escapeHTML as escHTML,
+  fuzzyScore,
+  IMG_EXTS,
+  installBackGuard,
+  installLazyMedia,
+  installScrollRestore,
+  isSensitive,
+  isValidSort,
+  joinAbs,
+  makeRevealButton,
+  makeRevealSet,
+  metaClipboardText,
+  metaRows,
+  nextRating,
+  notify,
+  onSafeViewChange,
+  openModalShell,
+  openShellOverlay,
+  postRating,
+  promptInShell,
+  ratingOf,
+  readSafeViewConfig,
+  SAFE_VIEW_GLYPH_OFF,
+  SAFE_VIEW_GLYPH_ON,
+  SORT_OPTIONS,
+  sensitiveKeyword,
+  setBlurred,
+  setSpoilered,
+  sortFiles,
+  starsHTML,
+  toggleSafeView,
+  VIDEO_EXTS,
+} from "@laurigates/comfy-modal-kit";
+// Runtime import, left unbundled by `bun build --external '/scripts/*'` and
+// resolved against ComfyUI's served module. Used only by loadWorkflow(), which
+// hands a File to the app's own loader rather than reimplementing graph parsing.
+import { app } from "/scripts/app.js";
+import {
+  type BatchItem,
+  type BrowseType,
+  deleteFile,
+  deleteMany,
+  EXT_NAME,
+  embeddedWorkflowJSON,
+  fetchBasePaths,
+  fetchListing,
+  fetchMetadata,
+  fetchPins,
+  fullSrcURL,
+  type ImageMetadata,
+  imageThumbURL,
+  invalidateBasePaths,
+  type ListingFile,
+  META_EXTS,
+  META_VIDEO_EXTS,
+  makeDir,
+  moveDir,
+  moveFile,
+  moveMany,
+  PATH_READS_DISABLED_MSG,
+  type PinEntry,
+  type PinItem,
+  pathReadsAllowed,
+  pinKeyOf,
+  pinsToFiles,
+  postPinDelta,
+  RATING_URL,
+  removeDir,
+  renameFile,
+  SANDBOXED_TYPES,
+  type TypeFilter,
+  thumbVersion,
+  uploadFiles,
+  videoSrcURL,
+} from "./api.js";
+import { labelParts } from "./label.js";
+import { openLightbox } from "./lightbox.js";
+// The rest of the mark-sensitive control stays per-pack — `tagRequestBody`,
+// `markSensitiveHTML` and `hasSensitiveTag` have deliberately diverged from
+// comfyui-gallery-loader's copies (no `type: "path"` arm here per ADR-0002, and
+// different CSS class names in the markup). Only `sensitiveKeyword` went to the
+// kit, and it is imported from there above.
+import { hasSensitiveTag, markSensitiveHTML, postTag, TAG_URL } from "./safe-tag.js";
+
+const STYLE_ID = "ib-style";
+// Pack-scoped, deliberately: comfyui-gallery-loader persists under
+// "comfyui-gallery-loader:sort", so the two surfaces keep independent
+// preferences and widening the menu here cannot hand that pack a value it
+// would reject.
+const SORT_STORAGE_KEY = "comfyui-image-browser:sort";
+
+interface BrowserState {
+  type: BrowseType;
+  subfolder: string;
+  absPath: string;
+  dirs: { name: string }[];
+  files: ListingFile[];
+  sortKey: string;
+  sortDir: string;
+  query: string;
+  viewMode: ViewMode;
+  typeFilter: TypeFilter;
+  density: GridDensity;
+}
+
+interface SavedSort {
+  key: string;
+  dir: string;
+}
+
+function loadSavedSort(): SavedSort | null {
+  try {
+    const raw = localStorage.getItem(SORT_STORAGE_KEY);
+    if (!raw || !isValidSort(raw)) return null;
+    const [key, dir] = raw.split(":");
+    return { key: key as string, dir: dir as string };
+  } catch {
+    return null;
+  }
+}
+
+function saveSort(key: string, dir: string): void {
+  try {
+    localStorage.setItem(SORT_STORAGE_KEY, `${key}:${dir}`);
+  } catch {
+    /* private-mode / disabled storage — non-fatal */
+  }
+}
+
+// View mode: "folder" is the classic one-directory-at-a-time grid; "flat"
+// recursively merges the current subfolder's whole subtree into one grid, each
+// card labelled with its relative subpath (for finding recent renders wherever
+// they landed). Persisted so the preference survives reopening the browser.
+//
+// The store — the read, the write, and the crashed-flat-load recovery
+// breadcrumb — is the kit's `createViewStore`; this pack carried a
+// body-identical copy of all three. The NAMESPACE is a parameter, and passing
+// the wrong one is the whole hazard the kit's own comment warns about: the keys
+// below are what this pack has written since flat view shipped, so a namespace
+// that is anything other than `comfyui-image-browser` reads a key nobody ever
+// wrote and silently orphans every user's stored preference while the UI still
+// looks fine. It must NOT be shared with comfyui-gallery-loader either — two
+// surfaces over different roots, and wanting flat view in one and not the other
+// is reasonable. Asserted literally in tests/js/kit-listing.test.js.
+const VIEW_NAMESPACE = "comfyui-image-browser";
+const viewStore = createViewStore(VIEW_NAMESPACE);
+
+// Media-type filter: narrows the listing to images or videos only. Filtered
+// SERVER-side (see api.ts's ListParams.kind) — both listing paths cap at 5000
+// files by mtime after sorting, so narrowing here in the client would filter an
+// already-truncated listing and under-report videos in exactly the folders
+// where you'd reach for the filter. Persisted like the sort and view
+// preferences; deliberately WITHOUT a view-pending-style recovery breadcrumb,
+// because unlike flat view a filter only ever makes a listing smaller and so
+// can never become a preference that reopens into its own failure.
+const FILTER_STORAGE_KEY = "comfyui-image-browser:filter";
+const VALID_FILTERS = new Set(["all", "images", "videos"]);
+
+function loadSavedFilter(): TypeFilter {
+  try {
+    const raw = localStorage.getItem(FILTER_STORAGE_KEY);
+    // Whitelist on read, like the kit's isValidSort: a stale or hand-edited value must
+    // fall back to "all" rather than reach the request as an unknown kind.
+    return raw && VALID_FILTERS.has(raw) ? (raw as TypeFilter) : "all";
+  } catch {
+    return "all";
+  }
+}
+
+function saveFilter(filter: TypeFilter): void {
+  try {
+    localStorage.setItem(FILTER_STORAGE_KEY, filter);
+  } catch {
+    /* private-mode / disabled storage — non-fatal */
+  }
+}
+
+// ---- Grid density ---------------------------------------------------------
+//
+// Three steps, applied as `data-density` on the grid so the CSS can key off it.
+//
+// THE DEFAULT STEP DELIBERATELY REUSES THE UNTOUCHED BASE `.ib-grid` RULE. The
+// stylesheet's `repeat(auto-fill, minmax(150px, 1fr))` is read back verbatim by
+// tests/js/card-actions.test.js, which also asserts the INLINE_ACTION_SLOTS
+// arithmetic two-sided against a hardcoded 150. Leaving "grid" on the base rule
+// means none of that has to be reworked, and CARD_MIN_WIDTH stays a true
+// statement about every card that renders an action row — because "dense" is the
+// only step that changes the track, and it renders no action row at all.
+//
+//   dense  84px track / 6px gap   4 columns at 390px   thumb + checkbox only
+//   grid   the base rule          2 columns at 390px   today's card, unchanged
+//   list   1fr                    one ITEM per row     64px thumb, details beside
+//
+// 84 at a 6px gap is the computed pair, not a round number: 4x84 + 3x6 = 354,
+// inside the 382px of grid content a 390px viewport leaves, with slack for a
+// 375px SE. (88px at the existing 10px gap is 382 exactly — zero slack, and it
+// drops to three columns on the smaller phone.)
+export type GridDensity = "dense" | "grid" | "list";
+const DENSITY_STORAGE_KEY = "comfyui-image-browser:density";
+const VALID_DENSITIES = new Set<string>(["dense", "grid", "list"]);
+
+// Per-density lazy-load lookahead. Dense puts ~4x the cards in one viewport, so
+// the fixed 300px would queue four times the requests ahead of the fold; list
+// puts one item per row, so it needs more.
+const DENSITY_ROOT_MARGIN: Record<GridDensity, string> = {
+  dense: "150px",
+  grid: "300px",
+  list: "600px",
+};
+
+// Chunked grid construction. Flat view lists up to FLAT_LIST_CAP (5000) files,
+// and building every card in one synchronous pass measured 1.5 s to painted
+// grid and 89,856 DOM nodes on a real 8136-file install — a single blocking
+// main-thread pass on a pack whose whole point is being usable from a phone.
+//
+// SYNC_CARD_BUDGET cards are painted before renderGrid returns; the rest are
+// appended CHUNK_CARDS at a time, one chunk per animation frame. 240 is chosen
+// to overfill the tallest plausible first screen: the dense step is a 84px
+// track, so a 1440px-tall desktop viewport at ~16 columns holds ~272 cards but
+// only ~120 of them above the fold on a phone. Overfilling matters because the
+// listing is sorted newest-first — the cards a session actually wants are the
+// first few dozen — and because the lazy-thumb observer's rootMargin looks
+// ahead of the fold, so a budget that stopped AT the fold would leave the
+// observer nothing to promote until the next frame landed.
+export const SYNC_CARD_BUDGET = 240;
+export const CHUNK_CARDS = 240;
+
+/**
+ * Read the saved density.
+ *
+ * Whitelisted on read and try/catch'd on both sides, exactly like
+ * loadSavedFilter above — a stale or hand-edited value falls back to the
+ * default rather than reaching the DOM as an unknown attribute.
+ *
+ * PER-DEVICE ON PURPOSE, and this is the one preference where that is a feature
+ * rather than a limitation: a phone and a desktop want different column counts
+ * from the same install. Do not read the comment at the pins migration below
+ * ("localStorage cannot span a phone and a desktop") as an argument to move this
+ * server-side — for pins that span IS the point, and here it is the opposite.
+ */
+function loadSavedDensity(): GridDensity {
+  try {
+    const raw = localStorage.getItem(DENSITY_STORAGE_KEY);
+    return raw && VALID_DENSITIES.has(raw) ? (raw as GridDensity) : "grid";
+  } catch {
+    return "grid";
+  }
+}
+
+function saveDensity(d: GridDensity): void {
+  try {
+    localStorage.setItem(DENSITY_STORAGE_KEY, d);
+  } catch {
+    /* private-mode / disabled storage — non-fatal */
+  }
+}
+
+// ---- The card action row's width budget -----------------------------------
+//
+// The row used to render every control it had — up to EIGHT on one card — into
+// a flex row with `flex: 1` and no `min-width`, so on the narrowest column each
+// button was about 15px wide. 🗑 delete sat 15px from ✎ rename, which is a
+// mis-tap that destroys a file. See #90.
+//
+// The floor is the family's D02 target, >=44px, hardcoded twice in the kit
+// (modal-shell.ts's 44x44 close control, hub.ts's 48px rows). The fix is to
+// stop deriving the button SIZE from the count and start deriving the COUNT
+// from the size — so the floor holds by construction instead of by having
+// picked a number that happens to work at one card width.
+//
+// These four are the CSS constants the row is laid out with; they are asserted
+// against the shipped stylesheet in tests/js/card-actions.test.js, because a
+// budget computed from numbers that have drifted out of the CSS is arithmetic
+// about a layout that does not exist.
+const CARD_MIN_WIDTH = 150; // .ib-grid  grid-template-columns: minmax(150px, 1fr)
+const ACTIONS_PADDING_X = 12; // .ib-actions  padding: 0 6px 6px
+const ACTIONS_GAP = 2; // .ib-actions  gap: 2px
+const TOUCH_FLOOR = 44; // .ib-act  min-width / min-height
+
+/**
+ * How many controls fit on the NARROWEST card at the touch floor.
+ *
+ * `auto-fill` + `minmax(150px, 1fr)` never produces a track under 150px, so
+ * this is the worst case and a count that holds here holds at every width. A
+ * wider column simply gives each of these buttons more than its minimum.
+ *
+ * (150 - 12 + 2) / (44 + 2) = 3.04 -> 3
+ */
+export const INLINE_ACTION_SLOTS = Math.floor(
+  (CARD_MIN_WIDTH - ACTIONS_PADDING_X + ACTIONS_GAP) / (TOUCH_FLOOR + ACTIONS_GAP),
+);
+
+// ---- Slow-load progress (issue #42) ----------------------------------
+// /list answers in ONE response, so there is no real progress to report. The
+// first listing after a ComfyUI restart opens every returned file on a cold
+// page cache (measured ~30 s for a capped flat listing on a real install), and
+// a bare "Loading…" for that long reads as a hang. So the status counts the
+// wait, and past LOAD_NOTE_MS a note says why a first load is slow.
+
+/** When the full-width "why is this slow" note appears. */
+export const LOAD_NOTE_MS = 3000;
+/** How often the elapsed counter repaints. */
+const LOAD_TICK_MS = 1000;
+
+/** The status text for a load that has been running `elapsedMs`. */
+export function loadingStatusText(elapsedMs: number): string {
+  if (elapsedMs < 1000) return "Loading…";
+  return `Loading… ${Math.floor(elapsedMs / 1000)}s`;
+}
+
+const LOAD_NOTE_FLAT =
+  "Still loading. The first flat listing after a ComfyUI restart reads every file from disk, so a large tree can take a while. Later loads are quick.";
+const LOAD_NOTE_FOLDER =
+  "Still loading. The first listing of a large folder after a ComfyUI restart reads every file from disk. Later loads are quick.";
+
+/** Label for each `data-action`, used by the overflow sheet's rows. */
+const ACTION_LABELS: Record<string, string> = {
+  open: "Open in new tab",
+  pin: "Pin / unpin",
+  marksensitive: "Mark sensitive",
+  meta: "Metadata",
+  workflow: "Load workflow",
+  rename: "Rename…",
+  move: "Move…",
+  delete: "Delete…",
+};
+
+/**
+ * Lay out one card's controls under the budget above.
+ *
+ * `controls` arrives in PRIORITY order (most-reached and least-destructive
+ * first) and may contain empty strings for controls this card does not offer.
+ * Everything past the budget moves behind a `⋯` button that opens a sheet of
+ * full-width rows — so the destructive actions are a deliberate second tap
+ * rather than a 15px neighbour, and nothing is dropped.
+ *
+ * `⋯` costs a slot itself, which is why the overflow case renders one fewer
+ * action than the fit case.
+ *
+ * The overflowed buttons are STASHED in the card rather than dropped, and the
+ * sheet is built from the stash. That keeps one source of truth for "which
+ * controls does this card offer": recomputing the set at sheet-open time would
+ * be a second copy of the canWrite / META_EXTS / safeKeyword gating, and the
+ * two would drift — which is precisely how a control ends up offered in one
+ * place and rejected in the other. The stash also carries each button's live
+ * state (a filled 📌, a pressed 🙈), so the sheet can show it without asking.
+ */
+function actionRowHTML(controls: string[]): string {
+  const present = controls.filter((c) => c !== "");
+  if (present.length <= INLINE_ACTION_SLOTS) return present.join("\n");
+  const inline = present.slice(0, INLINE_ACTION_SLOTS - 1);
+  const stashed = present.slice(inline.length);
+  return `${inline.join("\n")}
+    <button type="button" class="ib-act ib-act-more" data-action="more"
+      title="${stashed.length} more actions" aria-label="${stashed.length} more actions">⋯</button>
+    <div class="ib-more-stash" hidden>${stashed.join("\n")}</div>`;
+}
+
+// Last successful move destination — the picker opens there next time, so
+// sorting a batch of files into the same folder is one tap per file.
+const MOVE_DEST_STORAGE_KEY = "comfyui-image-browser:move-dest";
+
+function loadSavedDest(): Destination | null {
+  try {
+    const raw = localStorage.getItem(MOVE_DEST_STORAGE_KEY);
+    if (!raw) return null;
+    const i = raw.indexOf(":");
+    if (i < 0) return null;
+    const type = raw.slice(0, i) as BrowseType;
+    if (!SANDBOXED_TYPES.includes(type)) return null;
+    return { type, subfolder: raw.slice(i + 1) };
+  } catch {
+    return null;
+  }
+}
+
+function saveDest(d: Destination): void {
+  try {
+    localStorage.setItem(MOVE_DEST_STORAGE_KEY, `${d.type}:${d.subfolder}`);
+  } catch {
+    /* private-mode / disabled storage — non-fatal */
+  }
+}
+
+// Per-directory scroll positions — traversing up/down (or hopping via tabs,
+// crumbs, siblings, pins) returns each folder to where you left it. Module
+// level so reopening the browser restores too; entering a never-visited
+// folder still starts at the top (the kit's memory answers 0 for an unknown
+// key, which is what makes that the default rather than a special case).
+//
+// The store and the restore loop both come from the kit, so this pack and
+// comfyui-gallery-loader cannot drift on any of it.
+const scrollMemory = createScrollMemory();
+
+// Pins — folders (quick-nav chips in the toolbar, shortcut rows in the
+// move-destination picker) AND individual files (the 📌 pinned tab). Sandboxed
+// roots only, and the list lives on the SERVER (see api.ts's pins section):
+// localStorage cannot span a phone and a desktop, which are two browsers
+// against one ComfyUI, nor the sibling comfyui-gallery-loader pack.
+//
+// Module-level mirror of that list, refreshed from EVERY /pins response (the GET
+// and the delta POST both answer with the whole freshly-resolved list, which is
+// why no call here ever needs a follow-up GET). Module-level for two reasons:
+// the pinned state must be readable SYNCHRONOUSLY while renderGrid builds cards
+// — a GET per card is not an option — and pickDestination lives outside
+// openImageBrowser's closure yet needs the folder pins on every load().
+let pinEntries: PinEntry[] = [];
+let pinKeys = new Set<string>();
+
+function setPinCache(entries: PinEntry[]): void {
+  pinEntries = entries;
+  pinKeys = new Set(entries.map(pinKeyOf));
+}
+
+function isPinned(item: PinItem): boolean {
+  return pinKeys.has(pinKeyOf(item));
+}
+
+// Folder pins only — what the toolbar chips and the picker's shortcut rows are.
+function folderPins(): PinEntry[] {
+  return pinEntries.filter((p) => p.kind === "dir");
+}
+
+function pinLabel(p: PinItem): string {
+  return `${p.type}${p.subfolder ? `/${p.subfolder}` : ""}`;
+}
+
+// The pre-server list. Replayed into the store once, then deleted. Every entry
+// was a FOLDER pin — file pins never existed client-side.
+const PINS_STORAGE_KEY = "comfyui-image-browser:pins";
+
+// The prompt tier's progress poll. 3 s x 20 is about a minute of watching a
+// sweep before the pill goes quiet — long enough to cover a typical library,
+// short enough that a stalled sweep does not leave a request loop running.
+// Re-armed per LOCATION (see loadAndRender) and by tapping the pill.
+const SCAN_POLL_MS = 3000;
+const SCAN_POLL_MAX = 20;
+
+/**
+ * Move any localStorage pin list into the server store, then drop the key.
+ *
+ * Idempotent by construction: add-of-an-existing-pin is a successful no-op
+ * server-side, so a second run — or two devices migrating the same folders —
+ * cannot fail or duplicate. Never throws: the browser must open even when the
+ * store is unreachable, and a migration that could block the modal would be a
+ * worse bug than the one it fixes.
+ */
+async function migrateLocalPins(): Promise<void> {
+  let raw: string | null = null;
+  try {
+    raw = localStorage.getItem(PINS_STORAGE_KEY);
+  } catch {
+    return; // private-mode / disabled storage — nothing to migrate
+  }
+  if (!raw) return;
+  let legacy: { type?: unknown; subfolder?: unknown }[] = [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (Array.isArray(parsed)) legacy = parsed;
+  } catch {
+    legacy = [];
+  }
+  for (const p of legacy) {
+    const type = p?.type as BrowseType;
+    if (!p || typeof p.subfolder !== "string" || !SANDBOXED_TYPES.includes(type)) continue;
+    try {
+      setPinCache((await postPinDelta("add", { kind: "dir", type, subfolder: p.subfolder })).pins);
+    } catch (e) {
+      // A single rejected entry (or a full store) must not strand the rest, and
+      // must not keep the key alive forever — the pin is recoverable by hand,
+      // an un-migratable key is a permanent replay on every open.
+      console.warn(`[${EXT_NAME}] pin migration skipped ${type}/${p.subfolder}`, e);
+    }
+  }
+  try {
+    localStorage.removeItem(PINS_STORAGE_KEY);
+  } catch {
+    /* private-mode / disabled storage — non-fatal */
+  }
+}
+
+interface ThumbDescriptor {
+  kind: "img" | "video" | "icon";
+  src?: string;
+  text?: string;
+  // Tooltip for an icon tile that stands in for media the browser cannot show,
+  // so the substitution carries its reason with it rather than being a mute
+  // glyph the user has to guess at.
+  title?: string;
+}
+
+// ============================================================
+// Entry point
+// ============================================================
+
+const defaultNotify = notify;
+
+// Same-tab navigation state only: no image payloads or server tokens in storage.
+interface BrowserResume {
+  state: Omit<BrowserState, 'dirs' | 'files'>;
+  pageOffset: number;
+  pageScope: string;
+  searchText: string;
+  scrollTop: number;
+  selected: [string, { file: ListingFile; type: BrowseType; subfolder: string }][];
+  focusIndex: number;
+  clickAnchor: number;
+}
+const browserSessions = new Map<string, BrowserResume>();
+
+export function openImageBrowser(options: { resumeKey?: string; onClose?: () => void; compact?: boolean; decorateCard?: (card: HTMLElement, file: any) => void; onNotice?: (message: any) => void; rootLabel?: (type: string) => string; title?: string; listing?: (params: any) => Promise<any>; mount?: (context: { modal: ModalShellController; selection: () => BatchItem[]; refresh: () => Promise<void>; selectAll: () => void; clearSelection: () => void; navigate: (type: BrowseType) => Promise<void>; query: () => any; pageItems: () => BatchItem[]; updateAssets: (records: any[]) => void }) => void } = {}): ModalShellController {
+  const notify = options.onNotice ?? defaultNotify;
+  const stored = options.resumeKey ? browserSessions.get(options.resumeKey) : undefined;
+  const resume = stored && SANDBOXED_TYPES.includes(stored.state.type) ? stored : undefined;
+  let restoring = !!resume;
+  let clickAnchor = resume?.clickAnchor ?? -1;
+  ensureStyleOnce(STYLE_ID, BROWSER_CSS);
+  // /base carries `allow_path_reads`, which the user flips in the settings
+  // panel — a different surface, with no channel back to this module. Drop the
+  // cached answer on every open so the switch takes effect on the next open
+  // rather than on the next hard reload. (The backend already refuses to cache
+  // it for the same reason; the singleton in api.ts had reintroduced the
+  // staleness one layer up.)
+  invalidateBasePaths();
+
+  let pageOffset = resume?.pageOffset ?? 0, pageScope = resume?.pageScope ?? '', lastListing: any = null, lastQuery: any = null, loadGeneration = 0;
+  let searchTimer: ReturnType<typeof setTimeout>;
+  const savedView = viewStore.load();
+  const state: BrowserState = {
+    type: "output",
+    subfolder: "",
+    absPath: "",
+    dirs: [],
+    files: [],
+    sortKey: "mtime",
+    sortDir: "desc",
+    query: "",
+    viewMode: savedView.mode,
+    typeFilter: loadSavedFilter(),
+    density: loadSavedDensity(),
+  };
+  const savedSort = loadSavedSort();
+  if (savedSort) {
+    state.sortKey = savedSort.key;
+    state.sortDir = savedSort.dir;
+  }
+
+  if (resume) Object.assign(state, resume.state);
+
+  // Assigned just after the shell exists (the guard hit-tests modal.dialog),
+  // but onClose below closes over it, so it is declared here and nulled on
+  // teardown rather than being a const the closure would read in its TDZ.
+  let disposeBackGuard: (() => void) | null = null;
+
+  const modal = openModalShell({
+    title: options.title ?? "Image Browser",
+    placeholder: "Filter by filename…",
+    // Fill the whole viewport — the browser stands in for the canvas.
+    width: "100vw",
+    height: "100vh",
+    footerLeftHTML:
+      "<kbd>j/k</kbd> navigate · <kbd>i</kbd> metadata · <kbd>w</kbd> workflow · <kbd>b</kbd> safe view · <kbd>?</kbd> help · <kbd>Esc</kbd> close",
+    footerRightHTML: '<span class="ib-count"></span>',
+    // Fires on EVERY teardown path (Esc, × button, backdrop, coordinator
+    // dismiss) — the controller.close wrapper does not, so keyboard cleanup
+    // must hang off onClose or the window listener leaks after close.
+    onClose: () => {
+      // Remember where this folder was scrolled to so reopening the browser
+      // (scrollMemory is module-level) resumes in place.
+      rememberScroll();
+      if (options.resumeKey) {
+        const {dirs, files, ...view} = state;
+        browserSessions.set(options.resumeKey, {
+          state: view, pageOffset, pageScope, searchText: modal.searchEl.value,
+          scrollTop: restoring && resume ? resume.scrollTop : scroller.current(),
+          selected: structuredClone([...selected]), focusIndex, clickAnchor,
+        });
+      }
+      clearTimeout(searchTimer);
+      loadGeneration++;
+      options.onClose?.();
+      // Closing mid-load is a deliberate exit, not a crash — don't leave the
+      // breadcrumb armed or the next open falls back to folder view for nothing.
+      viewStore.markPending(false);
+      disposeLazyThumbs();
+      // Nothing scheduled may outlive the modal — the rAF tail is scheduled
+      // work exactly like the observer, and a chunk landing after close would
+      // build cards into a detached grid.
+      cancelChunkJob();
+      // AFTER rememberScroll() above, which reads the restorer's mirror — the
+      // one read that still works now the shell has detached the dialog. Drops
+      // the restorer's own listeners and cancels a re-assert loop that may still
+      // be running frame by frame against a node that is already gone (same rule
+      // as the observer: nothing scheduled may outlive the modal).
+      scroller.dispose();
+      window.removeEventListener("keydown", onWindowKey, true);
+      disposeBackGuard?.();
+      disposeBackGuard = null;
+      // Same rule as the observer and the restore loop: nothing scheduled or
+      // subscribed may outlive the modal. A kept listener would re-render a
+      // detached grid on every future settings change, for the rest of the page's
+      // life — one leak per open.
+      disposeSafeView();
+      // Same rule again: the scan poll is a timer, and a timer that outlives the
+      // modal re-lists a dead grid every 3 s forever.
+      cancelScanPoll();
+      // And the slow-load counter, which would otherwise tick against a detached
+      // status element until the listing it was counting finally lands.
+      cancelLoadTicker();
+      // Reveals are per-session by design: reopening the browser must not still
+      // be showing what the user unblurred an hour ago.
+      revealed.clear();
+    },
+  });
+  modal.dialog.classList.add("ib-dialog");
+  modal.searchEl.value = resume?.searchText ?? "";
+
+  // Root the smoke test asserts on; also the overlay host.
+  const root = document.createElement("div");
+  root.className = "image-browser-body";
+  modal.bodyEl.appendChild(root);
+
+  // ---- Toolbar: tabs + breadcrumbs + sort + refresh --------------
+  const tabsEl = document.createElement("div");
+  tabsEl.className = "ib-tabs";
+  for (const t of ["input", "output", "temp", "path", "pinned"] as BrowseType[]) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "ib-tab";
+    b.dataset.type = t;
+    b.textContent = t === "path" ? "browse…" : t === "pinned" ? "📌 pinned" : t;
+    tabsEl.appendChild(b);
+  }
+
+  const crumbsEl = document.createElement("div");
+  crumbsEl.className = "ib-crumbs";
+
+  const sortEl = document.createElement("select");
+  sortEl.className = "ib-control";
+  sortEl.title = "Sort";
+  // Options come from the kit so the menu and the isValidSort whitelist above
+  // cannot disagree, and so a sort order added to the kit reaches this pack
+  // instead of being silently dropped. The hardcoded list this replaced had
+  // drifted: it was missing size:asc and pixels:asc, and labelled pixels:desc
+  // "Highest resolution" where the kit says "Largest resolution".
+  sortEl.innerHTML = SORT_OPTIONS.map(
+    (o) => `<option value="${o.value}">${escHTML(o.label)}</option>`,
+  ).join("");
+  if (options.listing) {
+    for (const option of [...sortEl.options]) if (!['name','mtime','size'].includes(option.value.split(':')[0])) option.remove();
+    if (!['name','mtime','size'].includes(state.sortKey)) { state.sortKey='mtime'; state.sortDir='desc'; }
+  }
+  sortEl.value = `${state.sortKey}:${state.sortDir}`;
+
+  const refreshEl = document.createElement("button");
+  refreshEl.type = "button";
+  refreshEl.className = "ib-control ib-icon";
+  refreshEl.title = "Refresh";
+  refreshEl.textContent = "⟳";
+
+  // Flat view toggle: fold the whole subtree into one grid. Sandboxed roots
+  // only (recursion over an arbitrary base path is out of scope), so it hides
+  // on the browse-only path tab like the other write-gated controls.
+  const viewToggleEl = document.createElement("button");
+  viewToggleEl.type = "button";
+  viewToggleEl.className = "ib-control ib-icon ib-view-toggle";
+  viewToggleEl.title = "Flat view (all subfolders)";
+  viewToggleEl.textContent = "≣";
+
+  // Touch entry point into multi-select — the keyboard path (Space / v) has no
+  // affordance on a phone. Hidden on the browse-only path tab (renderTabs).
+  const selectToggleEl = document.createElement("button");
+  selectToggleEl.type = "button";
+  selectToggleEl.className = "ib-control ib-icon ib-select-toggle";
+  selectToggleEl.title = "Select multiple";
+  selectToggleEl.textContent = "☑";
+
+  // Pin the folder you're looking at; hidden on the browse-only path tab
+  // (pins are write-target shortcuts, and pin state renders in renderPins).
+  const pinToggleEl = document.createElement("button");
+  pinToggleEl.type = "button";
+  pinToggleEl.className = "ib-control ib-icon ib-pin-toggle";
+  pinToggleEl.title = "Pin this folder";
+  pinToggleEl.textContent = "📌";
+
+  // Create a folder in the current directory; hidden on the browse-only path
+  // tab (folder creation is a sandboxed write, like delete/rename/move).
+  const newFolderEl = document.createElement("button");
+  newFolderEl.type = "button";
+  newFolderEl.className = "ib-control ib-icon ib-newfolder";
+  newFolderEl.title = "New folder";
+  newFolderEl.textContent = "📁+";
+
+  // Upload into the current directory (#105). Same location-level gate as 📁+:
+  // a sandboxed write, so hidden on browse…/path, and hidden on the pinned tab,
+  // which is not a directory to upload into. The picker is a hidden file input;
+  // on iOS/Android `accept="image/*,video/*"` opens the camera roll, which is
+  // the case this exists for. Visually hidden rather than display:none, because
+  // some mobile browsers refuse a programmatic click() on an undisplayed input.
+  const uploadEl = document.createElement("button");
+  uploadEl.type = "button";
+  uploadEl.className = "ib-control ib-icon ib-upload";
+  uploadEl.title = "Upload files here";
+  uploadEl.textContent = "⬆︎";
+  const uploadInputEl = document.createElement("input");
+  uploadInputEl.type = "file";
+  uploadInputEl.multiple = true;
+  uploadInputEl.accept = "image/*,video/*";
+  uploadInputEl.className = "ib-upload-input";
+  uploadInputEl.tabIndex = -1;
+  uploadInputEl.setAttribute("aria-hidden", "true");
+
+  // Drop every pin whose file or folder is gone. Shown only in the pinned view,
+  // and only while there is something to prune — there is no watcher (a file
+  // deleted from the other pack, or over ssh, cannot notify this one), so a
+  // stale pin surfaces as a dimmed card and THIS is how it leaves the list.
+  const pruneEl = document.createElement("button");
+  pruneEl.type = "button";
+  pruneEl.className = "ib-control ib-prune";
+  pruneEl.title = "Remove pins whose file or folder no longer exists";
+  pruneEl.textContent = "🧹 Prune missing";
+  pruneEl.style.display = "none";
+
+  // Safe View's toolbar toggle. Shown on EVERY tab, including browse…/path:
+  // unlike ≣/📌/📁+ this is not a sandboxed-root affordance but a family-wide
+  // display preference, and the backend applies the hide on type=path too.
+  // The glyph is the STATE, not the action — 🙈 while matches are being
+  // hidden, 👁 while nothing is filtered — which is the same convention the
+  // hub toggle row uses, so the two never read as contradicting each other.
+  const safeToggleEl = document.createElement("button");
+  safeToggleEl.type = "button";
+  safeToggleEl.className = "ib-control ib-icon ib-safe-toggle";
+
+  // Safe View's prompt tier reports how many files it could not yet judge. That
+  // number is the difference between "these files matched your keywords" and
+  // "I have not looked at these yet" — and without it, first enabling the tier
+  // on a large library shows a mostly-blurred grid that looks broken rather
+  // than busy. Hidden whenever the count is 0, which is the steady state.
+  //
+  // A button, not a label: tapping it re-lists, so a user watching the sweep
+  // has a way to pull progress without hunting for the refresh control. The
+  // bounded auto-poll below does the same thing on a timer.
+  const scanPillEl = document.createElement("button");
+  scanPillEl.type = "button";
+  scanPillEl.className = "ib-control ib-scan-pill";
+  scanPillEl.title =
+    "Files whose generation prompt has not been scanned yet — blurred until it is. Tap to refresh.";
+  scanPillEl.style.display = "none";
+
+  // Media-type filter — a segmented All / 🖼 Images / 🎬 Videos control on its
+  // own full-width toolbar row (.ib-filter is the row, .ib-filter-group the
+  // pill; flex-basis:100% on the pill itself would stretch its border across
+  // the whole toolbar). Shown on EVERY tab, including browse…/path: unlike the
+  // flat toggle it isn't a sandboxed-root affordance — the backend applies the
+  // extension filter on type=path identically. The segments deliberately do not
+  // carry the .ib-tab class or a data-type attribute even though they share its
+  // CSS: several tests select tabs dialog-wide by both.
+  const filterEl = document.createElement("div");
+  filterEl.className = "ib-filter";
+  const filterGroupEl = document.createElement("div");
+  filterGroupEl.className = "ib-filter-group";
+  for (const [value, label, title] of [
+    ["all", "All", "Show images and videos"],
+    ["images", "🖼 Images", "Show images only"],
+    ["videos", "🎬 Videos", "Show videos only"],
+  ] as [TypeFilter, string, string][]) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "ib-filter-seg";
+    b.dataset.filter = value;
+    b.title = title;
+    b.textContent = label;
+    filterGroupEl.appendChild(b);
+  }
+  filterEl.appendChild(filterGroupEl);
+
+  // Grid density — a second pill on the SAME full-width row as the type filter,
+  // pushed to its far end. Deliberately not a new toolbar row: at a phone width
+  // the toolbar already wraps to three rows (four with pins), and it leaves the
+  // grid ~264px of an 844px viewport — less than one card's height. A fourth row
+  // would spend the thing this control exists to give back.
+  //
+  // A 3-segment control rather than a slider or a pinch: pinch races the grid's
+  // own pointerdown/move/up (drag-select) and long-press, and has no state
+  // readout; a slider makes the card width a real number, so INLINE_ACTION_SLOTS
+  // would have to be recomputed per width and the 44px floor would hold only at
+  // some of them. Three discrete steps keep the budget a constant.
+  const densityGroupEl = document.createElement("div");
+  densityGroupEl.className = "ib-density-group";
+  for (const [value, glyph, title] of [
+    ["dense", "\u229E", "Small cards — more per screen"],
+    ["grid", "\u25A6", "Medium cards"],
+    ["list", "\u2630", "One per row, with details"],
+  ] as [GridDensity, string, string][]) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "ib-density-seg";
+    b.dataset.density = value;
+    b.title = title;
+    b.setAttribute("aria-label", title);
+    b.textContent = glyph;
+    densityGroupEl.appendChild(b);
+  }
+  if(options.compact){
+    densityGroupEl.classList.add('ah-view-switch');
+    for(const button of densityGroupEl.querySelectorAll('button')){
+      const title=({dense:'小さい画像',grid:'大きい画像',list:'詳細一覧'} as any)[button.dataset.density!];
+      button.textContent=title;button.title=title;button.setAttribute('aria-label',title);
+    }
+  }
+  filterEl.appendChild(densityGroupEl);
+
+  // One-tap navigation chips for the pinned folders; hidden while empty.
+  const pinsEl = document.createElement("div");
+  pinsEl.className = "ib-pins";
+
+  // The slow-load note (see LOAD_NOTE_MS). A toolbar row rather than the status
+  // text: the status sits beside the search input with `white-space: nowrap`, so
+  // a sentence there is clipped on a phone. In the toolbar, outside the body, so
+  // the busy dim does not fade it. role=status announces it once when its text
+  // is set; the per-second counter is in the status element, which is not a
+  // live region, so a screen reader does not hear every tick.
+  const loadNoteEl = document.createElement("div");
+  loadNoteEl.className = "ib-load-note";
+  loadNoteEl.setAttribute("role", "status");
+  loadNoteEl.hidden = true;
+
+  if(options.compact){
+    state.typeFilter='images';
+    for(const el of [tabsEl,selectToggleEl,pinToggleEl,newFolderEl,uploadEl,pruneEl,filterEl,pinsEl,scanPillEl,loadNoteEl])el.classList.add('ah-unused');
+  }
+  modal.toolbarEl.append(
+    tabsEl,
+    crumbsEl,
+    viewToggleEl,
+    selectToggleEl,
+    pinToggleEl,
+    newFolderEl,
+    uploadEl,
+    uploadInputEl,
+    pruneEl,
+    safeToggleEl,
+    scanPillEl,
+    sortEl,
+    refreshEl,
+    filterEl,
+    pinsEl,
+    loadNoteEl,
+  );
+
+  if(options.compact)modal.toolbarEl.append(densityGroupEl);
+  // ---- Grid ------------------------------------------------------
+  const gridEl = document.createElement("div");
+  gridEl.className = "ib-grid";
+  root.appendChild(gridEl);
+
+  // The modal shell's body (.cmp-body) is the overflow-y:auto container the
+  // grid scrolls in — renderGrid saves/restores its scrollTop so deletes,
+  // moves, renames and rating changes don't fling the view back to the top.
+  const scrollHost = modal.bodyEl;
+
+  // ---- Scroll restore --------------------------------------------
+  // The mechanism lives in the kit (`installScrollRestore`), because
+  // comfyui-gallery-loader's picker needs exactly the same behaviour over the
+  // same card grid and a second copy would drift. What it does, and why none of
+  // it can be a bare `scrollHost.scrollTop = n`, is documented at length in
+  // comfy-modal-kit/src/scroll-restore.ts; the short version is four measured
+  // failures — the close path reads a DETACHED element (which answers 0), the
+  // assignment CLAMPS against the layout in force at that instant, iOS momentum
+  // keeps decelerating after the finger is up, and a restore that outlives the
+  // user's next gesture swallows it.
+  //
+  // This pack supplies the two things only the call site knows: which element
+  // actually scrolls, and what "the user is typing" means here (the search
+  // field is autofocused, so treating a caret key as a scroll gesture would
+  // disarm the restore on every keystroke of a filter).
+  //
+  // The pack's own vim keys need no entry in the kit's scroll-key set: they
+  // route through applyFocus(), which cancels the restore itself.
+  const scroller = installScrollRestore(scrollHost, { isTypingTarget: () => isInInput() });
+
+  // ---- Floating batch-action bar (visible while a selection exists) ----
+  const selBar = document.createElement("div");
+  selBar.className = "ib-selbar";
+  selBar.innerHTML = `
+    <span class="ib-selbar-count"></span>
+    <button type="button" class="ib-selbar-btn" data-selbar="pin">📌 Pin</button>
+    <button type="button" class="ib-selbar-btn" data-selbar="move">⇄ Move…</button>
+    <button type="button" class="ib-selbar-btn ib-selbar-danger" data-selbar="delete">🗑 Delete</button>
+    <button type="button" class="ib-selbar-btn" data-selbar="clear">✕</button>`;
+  const selBarCount = selBar.querySelector(".ib-selbar-count") as HTMLElement;
+  modal.dialog.appendChild(selBar);
+
+  const countEl = modal.footerEl.querySelector(".ib-count") as HTMLElement | null;
+  function setCount(visible: number, total: number): void {
+    if (countEl) countEl.textContent = `${visible} / ${total}`;
+  }
+
+  // ---- Safe View --------------------------------------------------
+  // The family's sensitive-content filter. Everything shared — the settings,
+  // the token matcher, the blur/spoiler CSS and the reveal button — lives in
+  // comfy-modal-kit so this pack and comfyui-gallery-loader cannot disagree
+  // about which files are sensitive. This block is only the wiring.
+  //
+  // DISCRETION, NOT ACCESS CONTROL. The blur is a CSS class and the blurred
+  // bytes are still fetched; it defeats a shoulder, not an adversary.
+
+  // Addresses the user has explicitly revealed. Held for the MODAL SESSION so
+  // an in-place re-render (a delete, a rating, a pin) does not re-blur the card
+  // being worked on, and cleared on close and on any change of location — see
+  // the reset in loadAndRender.
+  const revealed = makeRevealSet();
+  let revealLocation: string | null = null;
+
+  /**
+   * The `path` haystack for one card — the file's LOGICAL folder address.
+   *
+   * The root segment is included deliberately: `fileSub()` returns the bare
+   * subfolder, so handing it straight to `isSensitive` would drop `output` /
+   * `input` / `temp` from every haystack and a keyword naming a root would
+   * silently match nothing. The backend builds the same string
+   * (`f"{type_name}/{subfolder}"`), and the two MUST agree — a file one side
+   * hides and the other blurs is a file that renders differently in two packs
+   * looking at the same disk.
+   */
+  function safePathOf(f: ListingFile): string {
+    // In path mode the absolute directory IS the logical address, and it is
+    // what the backend matches against too.
+    if (state.type === "path") return state.absPath;
+    return `${fileType(f)}/${fileSub(f)}`;
+  }
+
+  /**
+   * The Safe View target for one card.
+   *
+   * `promptMatch` is passed straight through, INCLUDING when it is absent. The
+   * kit distinguishes four states and the two that look alike are the two that
+   * matter: `"unscanned"` reads as sensitive (fail-safe for an unknown), while
+   * an absent key means the file is outside the tier and is never sensitive by
+   * it. Defaulting the absent case to anything — `false` or `"unscanned"` —
+   * collapses that distinction, and one of those two collapses blurs every
+   * pinned card and every file the backend has no reader for.
+   */
+  function safeTargetOf(f: ListingFile): SafeViewTarget {
+    // `tags` is the file's `dc:subject` keywords, and the kit TOKENIZES each
+    // one rather than comparing it whole — `nsfw art` matches `nsfw`, `assets`
+    // still does not match `ass`. The backend applies the same rule through
+    // `is_safe_match`, so a file it hides is a file this blurs. Absent on a row
+    // from an older backend, which the kit reads as "no tags" rather than as a
+    // match.
+    return {
+      name: f.name,
+      path: safePathOf(f),
+      tags: f.tags,
+      promptMatch: f.prompt_match,
+    };
+  }
+
+  /** Whether this card should be blurred right now — match AND not revealed. */
+  function isCardHidden(f: ListingFile, cfg: SafeViewConfig): boolean {
+    if (!isSensitive(safeTargetOf(f), cfg)) return false;
+    return !revealed.has(fileType(f), fileSub(f), f.name);
+  }
+
+  /** Paint the toolbar toggle from the live setting, not from a local flag. */
+  function renderSafeToggle(cfg: SafeViewConfig): void {
+    // "Active" needs BOTH switched on and a non-empty keyword list — with no
+    // keywords the filter is a no-op, and showing 🙈 would claim a protection
+    // that is not in force.
+    const active = cfg.enabled && cfg.keywords.length > 0;
+    safeToggleEl.classList.toggle("is-active", active);
+    safeToggleEl.textContent = active ? SAFE_VIEW_GLYPH_ON : SAFE_VIEW_GLYPH_OFF;
+    safeToggleEl.title = active
+      ? "Safe View is on — matching thumbnails are blurred (b)"
+      : "Safe View is off — nothing is filtered (b)";
+    safeToggleEl.setAttribute("aria-pressed", String(active));
+  }
+
+  safeToggleEl.addEventListener("click", () => toggleSafeView());
+
+  // ---- The prompt tier's "scanning N" pill ------------------------
+  //
+  // Bounded auto-poll, deliberately. The backend's sweep has no channel to push
+  // progress here, so the grid would otherwise stay blurred until the user
+  // happened to re-list. Three disciplines keep the timer honest, and they are
+  // the same ones thumbObserver and restoreScroll already follow:
+  //
+  //   * it is cancelled on close and re-armed by each load, so nothing
+  //     scheduled outlives the modal or a navigation;
+  //   * it stops the moment the count reaches 0 — the steady state costs
+  //     nothing;
+  //   * it is capped at SCAN_POLL_MAX ticks, so a sweep that stalls (an
+  //     unreadable tree, a full disk) settles into a visible "scanning N" pill
+  //     rather than an endless request loop nobody asked for.
+  let scanPollTimer: ReturnType<typeof setTimeout> | null = null;
+  let scanPollsLeft = 0;
+
+  function cancelScanPoll(): void {
+    if (scanPollTimer !== null) {
+      clearTimeout(scanPollTimer);
+      scanPollTimer = null;
+    }
+  }
+
+  /** Paint the pill from a listing's unscanned count, and arm the next poll. */
+  function renderScanPill(unscanned: number): void {
+    cancelScanPoll();
+    if (unscanned <= 0) {
+      scanPillEl.style.display = "none";
+      scanPollsLeft = 0;
+      return;
+    }
+    scanPillEl.style.display = "";
+    scanPillEl.textContent = `🔍 scanning ${unscanned}`;
+    if (scanPollsLeft > 0) {
+      scanPollsLeft -= 1;
+      scanPollTimer = setTimeout(() => {
+        scanPollTimer = null;
+        void loadAndRender({ preserveScroll: true });
+      }, SCAN_POLL_MS);
+    }
+  }
+
+  scanPillEl.addEventListener("click", () => {
+    // An explicit tap re-arms the budget: the user asking for progress is the
+    // signal that the poll is worth spending again.
+    scanPollsLeft = SCAN_POLL_MAX;
+    void loadAndRender({ preserveScroll: true });
+  });
+
+  // Repaint when the preference changes ANYWHERE — the other gallery pack, the
+  // settings dialog, or the Touch Tools chooser's toggle row. Only one pack's
+  // settings registration actually takes effect (a duplicate id is skipped),
+  // and which one wins has no stable winner, so subscribing to the kit's bus is
+  // the only way this modal reliably hears its own toggle.
+  //
+  // A full reload rather than a re-render: with hiding on, the set of files is
+  // decided by the SERVER, so a re-render would repaint a listing that no
+  // longer reflects the setting. Reloading unconditionally costs one listing
+  // request on an explicit user action and cannot be wrong; branching on the
+  // old value could be.
+  const disposeSafeView = onSafeViewChange(() => {
+    void loadAndRender({ preserveScroll: true });
+  });
+
+  // ---- Vim-style keyboard navigation state ----------------------
+  // Selection persists across tabs/dirs; key `${type}:${subfolder}:${name}`.
+  // `type=path` is never selectable (backend rejects path writes).
+  const selected = new Map<string, { file: ListingFile; type: BrowseType; subfolder: string }>(resume ? structuredClone(resume.selected) : []);
+  // Touch select mode: while on, tapping a card toggles selection instead of
+  // opening it. Entered via the ☑ toolbar toggle or a long-press on a card.
+  let selectMode = false;
+  let focusIndex = resume?.focusIndex ?? -1;
+  let visualMode = false;
+  let visualAnchor = 0;
+  let pendingOp: "d" | "y" | "g" | null = null;
+  let pendingTimer: ReturnType<typeof setTimeout> | null = null;
+  let yanked: BatchItem[] | null = null;
+  let renderedFiles: ListingFile[] = [];
+
+  const selectedBadge = document.createElement("span");
+  selectedBadge.className = "ib-selected-badge";
+  selectedBadge.style.display = "none";
+  modal.headerEl.appendChild(selectedBadge);
+
+  // ---- Navigation helpers ---------------------------------------
+  // Flat view is only in effect on a sandboxed root — the toggle is hidden on
+  // the path tab and the backend ignores `recursive` there, so guard both.
+  function isFlat(): boolean {
+    return state.viewMode === "flat" && SANDBOXED_TYPES.includes(state.type);
+  }
+
+  // A file's effective subfolder: in folder view every file lives in
+  // state.subfolder; in flat view each carries its own subpath, joined onto the
+  // request subfolder. Every per-file address (thumbnail, open, delete, rename,
+  // move, rating, selection key) routes through this so both views share one
+  // code path.
+  function fileSub(f: ListingFile): string {
+    // A pinned card carries its own absolute-within-the-root subfolder; there is
+    // no "requested subfolder" for it to be relative to (see api.ts's pinSub).
+    if (f.pinSub !== undefined) return f.pinSub;
+    const sp = f.subpath || "";
+    if (!sp) return state.subfolder;
+    const base = state.subfolder.replace(/\/+$/, "");
+    return base ? `${base}/${sp}` : sp;
+  }
+
+  // Sibling of fileSub(). In folder/flat view every card lives under state.type;
+  // in the pinned view each card carries its own root, because pins span roots.
+  // Every per-file address (thumbnail, open, delete, rename, move, rating,
+  // selection key, pin) pairs this with fileSub() — pairing fileSub() with the
+  // bare state.type would address the pinned file's name under the WRONG root.
+  function fileType(f: ListingFile): BrowseType {
+    return f.pinType ?? state.type;
+  }
+
+  // Per-card write gate — the mirror of the backend's sandbox, evaluated for the
+  // CARD rather than the location. This is what keeps rename/move/delete/stars/
+  // ✓ alive in the pinned view, where the LOCATION type ("pinned") is not a
+  // sandboxed root but every card's own type is.
+  function canWriteFile(f: ListingFile): boolean {
+    return SANDBOXED_TYPES.includes(fileType(f));
+  }
+
+  function isPinnedView(): boolean {
+    return state.type === "pinned";
+  }
+
+  // Location-level selection gate. Selection is meaningful wherever the cards
+  // are writable — the sandboxed tabs and the pinned view — and never on
+  // browse…/path. The per-card guards below are the ones that decide what a
+  // given tap may actually select.
+  function canSelectHere(): boolean {
+    return SANDBOXED_TYPES.includes(state.type) || isPinnedView();
+  }
+
+  // The pin that addresses this card's file.
+  function filePinItem(f: ListingFile): PinItem {
+    return { kind: "file", type: fileType(f), subfolder: fileSub(f), name: f.name };
+  }
+
+  // Project a cached PinEntry back to the four keys the store owns. A PinEntry
+  // also carries the RESOLVED fields (exists, mtime, size, …), and the store
+  // preserves unknown keys verbatim by design — so posting an entry back
+  // unprojected would persist a stale stat block into the shared file.
+  function pinItemOf(p: PinItem): PinItem {
+    return p.kind === "file"
+      ? { kind: "file", type: p.type, subfolder: p.subfolder, name: p.name }
+      : { kind: "dir", type: p.type, subfolder: p.subfolder };
+  }
+
+  // Every pin addressing a folder, or anything inside it. Used when this pack
+  // deletes or moves a directory: those pins are dead addresses the moment the
+  // folder goes, whether they are the folder itself or files under it.
+  function pinsUnder(type: BrowseType, sub: string): PinItem[] {
+    return pinEntries
+      .filter((p) => p.type === type && (p.subfolder === sub || p.subfolder.startsWith(`${sub}/`)))
+      .map(pinItemOf);
+  }
+
+  // Key for the CURRENT location's scroll-memory slot. Distinct namespaces
+  // for the sandboxed roots (`type:subfolder`) and path mode (`path:/abs`).
+  // Flat view gets its own slot so toggling doesn't restore the wrong offset.
+  // The type filter gets its own slot too — a Videos listing is a different
+  // (usually much shorter) list than the All listing of the same folder, so
+  // sharing a slot would restore an offset measured against the wrong one.
+  // Empty suffix for the default, like `:flat` above, so an unfiltered session's
+  // keys are unchanged.
+  function locationKey(): string {
+    const view = isFlat() ? ":flat" : "";
+    const filter = state.typeFilter === "all" ? "" : `:${state.typeFilter}`;
+    return state.type === "path"
+      ? `path:${state.absPath}${filter}`
+      : `${state.type}:${state.subfolder}${view}${filter}`;
+  }
+
+  // Called on every navigation BEFORE the location mutates, so returning to
+  // this folder later (up, chip, tab, crumb) lands where the user left off.
+  // Goes through scroller.current() — NOT scrollHost.scrollTop — because the
+  // close path calls this after the shell has already detached the dialog, and
+  // a detached element reads 0 (see the scroll-restore block above).
+  function rememberScroll(): void {
+    scrollMemory.remember(locationKey(), scroller.current());
+  }
+
+  function navigateUp(): void {
+    rememberScroll();
+    if (state.type === "path") {
+      const p = (state.absPath || "/").replace(/\/+$/, "");
+      if (p === "" || p === "/") return;
+      const i = p.lastIndexOf("/");
+      state.absPath = i <= 0 ? "/" : p.slice(0, i);
+    } else {
+      const p = state.subfolder.replace(/\/+$/, "");
+      const i = p.lastIndexOf("/");
+      state.subfolder = i <= 0 ? "" : p.slice(0, i);
+    }
+    loadAndRender();
+  }
+
+  function navigateInto(name: string): void {
+    rememberScroll();
+    if (state.type === "path") {
+      state.absPath = joinAbs(state.absPath, name);
+    } else {
+      const base = state.subfolder.replace(/\/+$/, "");
+      state.subfolder = base ? `${base}/${name}` : name;
+    }
+    loadAndRender();
+  }
+
+  async function switchType(type: BrowseType): Promise<void> {
+    rememberScroll();
+    state.type = type;
+    state.subfolder = "";
+    if (type === "path") {
+      const bp = await fetchBasePaths();
+      state.absPath = bp.base_path || "/";
+    }
+    loadAndRender();
+  }
+
+  // ---- Android/mobile back button --------------------------------
+  // A sentinel history entry is pushed while the browser is open, so the
+  // hardware/gesture back pops it instead of leaving ComfyUI. The pop handler
+  // dismisses an open overlay, else ascends one directory (re-arming the
+  // sentinel each time), and only closes the browser at a root. Every other
+  // close path pops the still-unconsumed sentinel from onClose instead.
+  function canGoUp(): boolean {
+    return state.type === "path" ? !!state.absPath && state.absPath !== "/" : !!state.subfolder;
+  }
+
+  disposeBackGuard = installBackGuard(() => {
+    const hasOverlay = !!modal.dialog.querySelector(".cmp-ov-backdrop");
+    if (hasOverlay) {
+      // Route through the overlay's ESC path so its onDismiss fires.
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", cancelable: true }));
+      return true;
+    }
+    if (canGoUp()) {
+      navigateUp();
+      return true;
+    }
+    modal.close();
+    return false;
+  });
+
+  // ---- Wiring ----------------------------------------------------
+  modal.searchEl.addEventListener("input", () => {
+    state.query = modal.searchEl.value.toLowerCase().trim();
+    // New filter → read results from the top (renderGrid otherwise restores
+    // the previous scroll position, which is for in-place mutations). Handed
+    // IN rather than assigned after: renderGrid's restore defends the offset
+    // it was given for a few frames, so a follow-up `scrollTop = 0` would be
+    // a race against it.
+    if(options.listing) { clearTimeout(searchTimer); searchTimer=setTimeout(()=>void loadAndRender(),250); } else renderGrid({ scrollTo: 0 });
+  });
+  sortEl.addEventListener("change", () => {
+    const [k, d] = sortEl.value.split(":");
+    state.sortKey = k as string;
+    state.sortDir = d as string;
+    saveSort(k as string, d as string);
+    if(options.listing) { clearTimeout(searchTimer); searchTimer=setTimeout(()=>void loadAndRender(),250); } else renderGrid({ scrollTo: 0 });
+  });
+  refreshEl.addEventListener("click", () => loadAndRender({ preserveScroll: true, rescan: true }));
+  newFolderEl.addEventListener("click", () => void onNewFolder());
+  uploadEl.addEventListener("click", () => {
+    if (!SANDBOXED_TYPES.includes(state.type)) return;
+    // Cleared first so picking the same file again still fires `change`.
+    uploadInputEl.value = "";
+    uploadInputEl.click();
+  });
+  uploadInputEl.addEventListener("change", () => {
+    const files = Array.from(uploadInputEl.files ?? []);
+    if (files.length > 0) void onUpload(files);
+  });
+  viewToggleEl.addEventListener("click", () => {
+    if (!SANDBOXED_TYPES.includes(state.type)) return;
+    rememberScroll();
+    state.viewMode = state.viewMode === "flat" ? "folder" : "flat";
+    viewStore.save(state.viewMode);
+    // Flat needs a recursive re-fetch; the folder→flat and flat→folder slots
+    // are distinct in scrollMemory, so loadAndRender lands each at its own place.
+    loadAndRender();
+  });
+  filterEl.addEventListener("click", (e) => {
+    const seg = (e.target as HTMLElement).closest("[data-filter]") as HTMLElement | null;
+    if (!seg) return;
+    const next = seg.dataset.filter as TypeFilter;
+    if (next === state.typeFilter) return;
+    rememberScroll();
+    state.typeFilter = next;
+    saveFilter(next);
+    // A new listing, not a re-slice of the one already fetched — the narrowing
+    // happens on the server, above the cap. Hence loadAndRender, not renderGrid.
+    // No SANDBOXED_TYPES guard, unlike the flat toggle above: the filter is
+    // valid on the browse…/path tab too.
+    loadAndRender();
+  });
+  densityGroupEl.addEventListener("click", (e) => {
+    const seg = (e.target as HTMLElement).closest("[data-density]") as HTMLElement | null;
+    if (!seg) return;
+    const next = seg.dataset.density as GridDensity;
+    if (next === state.density) return;
+    state.density = next;
+    saveDensity(next);
+    // renderGrid(), never a bare attribute flip on the live grid: the lazy-thumb
+    // IntersectionObserver is disposed and reinstalled as the last statement of
+    // renderGrid, and a CSS-only change would strand it computing against the
+    // old layout with the old rootMargin. renderGrid with no argument also
+    // captures and restores the live scroll offset, so the view stays put.
+    // Unlike the type filter this needs NO refetch — the listing is unchanged.
+    renderGrid();
+  });
+  selectToggleEl.addEventListener("click", () => setSelectMode(!selectMode));
+  pinToggleEl.addEventListener("click", () => void toggleFolderPinHere());
+  pruneEl.addEventListener("click", () => void onPruneMissing());
+  pinsEl.addEventListener("click", (e) => {
+    const t = e.target as HTMLElement;
+    const chip = t.closest("[data-pin-type]") as HTMLElement | null;
+    if (!chip) return;
+    const type = chip.dataset.pinType as BrowseType;
+    if (!SANDBOXED_TYPES.includes(type)) return;
+    const pin: PinItem = { kind: "dir", type, subfolder: chip.dataset.pinSub || "" };
+    if (t.closest(".ib-pin-x")) {
+      void unpinFolder(pin);
+      return;
+    }
+    if (pin.type === state.type && pin.subfolder === state.subfolder) return;
+    rememberScroll();
+    state.type = pin.type;
+    state.subfolder = pin.subfolder;
+    loadAndRender();
+  });
+  selBar.addEventListener("click", (e) => {
+    const b = (e.target as HTMLElement).closest("[data-selbar]") as HTMLElement | null;
+    if (!b) return;
+    const action = b.dataset.selbar;
+    if (action === "move") void doMoveSelected();
+    else if (action === "delete") void doDelete();
+    else if (action === "pin") void doPinSelected();
+    else if (action === "clear") {
+      setSelectMode(false);
+      clearSelection();
+    }
+  });
+  tabsEl.addEventListener("click", (e) => {
+    const b = (e.target as HTMLElement).closest("[data-type]") as HTMLElement | null;
+    if (!b) return;
+    const t = b.dataset.type as BrowseType;
+    if (state.type === t) return;
+    switchType(t);
+  });
+  crumbsEl.addEventListener("click", (e) => {
+    const c = (e.target as HTMLElement).closest("[data-sub], [data-abs]") as HTMLElement | null;
+    if (!c) return;
+    rememberScroll();
+    if (c.dataset.abs !== undefined) state.absPath = c.dataset.abs || "/";
+    else state.subfolder = c.dataset.sub || "";
+    loadAndRender();
+  });
+
+  gridEl.addEventListener("click", (e) => {
+    // A completed long-press or drag-select already consumed this gesture —
+    // the trailing click must not also open/toggle.
+    if (suppressClick) {
+      suppressClick = false;
+      e.stopPropagation();
+      return;
+    }
+    const target = e.target as HTMLElement;
+    const actionBtn = target.closest("[data-action]") as HTMLElement | null;
+    const card = target.closest(".ib-card") as HTMLElement | null;
+    if (!card) return;
+    if (card.classList.contains("is-up")) {
+      navigateUp();
+      return;
+    }
+    if (card.classList.contains("is-dir")) {
+      if (actionBtn?.dataset.action === "rmdir") {
+        e.stopPropagation();
+        void onDeleteDir(card.dataset.name as string);
+        return;
+      }
+      if (actionBtn?.dataset.action === "movedir") {
+        e.stopPropagation();
+        void onMoveDir(card.dataset.name as string);
+        return;
+      }
+      navigateInto(card.dataset.name as string);
+      return;
+    }
+    // File card. Resolve the exact file by index — in flat view a bare name is
+    // not unique across subfolders, so every handler takes the file object.
+    const idx = Number(card.dataset.idx);
+    const f = renderedFiles[idx];
+    // Subpath label (flat view) — a tap jumps to that folder in folder view.
+    const subEl = target.closest(".ib-subpath") as HTMLElement | null;
+    if (subEl) {
+      e.stopPropagation();
+      rememberScroll();
+      state.viewMode = "folder";
+      viewStore.save("folder");
+      // In the pinned view the label carries the card's own ROOT as well, since
+      // pins span roots; in flat view it is always the current root, and the
+      // attribute is absent.
+      const t = subEl.dataset.pinType as BrowseType | undefined;
+      if (t && SANDBOXED_TYPES.includes(t)) state.type = t;
+      state.subfolder = subEl.dataset.sub || "";
+      loadAndRender();
+      return;
+    }
+    if (!f) return;
+    if(options.compact){focusIndex=idx;for(const c of fileCards())c.classList.toggle("is-focused",Number(c.dataset.idx)===idx);}
+    if(e.shiftKey && canWriteFile(f) && !actionBtn) {
+      e.stopPropagation();setSelectedRange(clickAnchor<0?idx:clickAnchor,idx,true);
+      modal.dialog.dispatchEvent(new Event('hub-user-selection'));return;
+    }
+    if(options.compact && !actionBtn && !target.closest('.ib-star')){
+      e.stopPropagation();clickAnchor=idx;toggleSelectionAt(idx);
+      modal.dialog.dispatchEvent(new Event('hub-user-selection'));return;
+    }
+    // Checkbox tap — toggle selection (drag-selects are handled on pointermove
+    // and suppress this click).
+    if (target.closest("[data-check]")) {
+      e.stopPropagation();
+      clickAnchor=idx;toggleSelectionAt(idx);
+      return;
+    }
+    const star = target.closest(".ib-star") as HTMLElement | null;
+    if (star) {
+      e.stopPropagation();
+      const row = star.closest(".ib-stars") as HTMLElement | null;
+      // Interactive stars only render for a card whose OWN root is sandboxed
+      // (canWriteFile); the defensive gate keeps a stale DOM from posting a
+      // path write.
+      if (!row || !canWriteFile(f)) return;
+      const cur = Number(row.dataset.rating || "0");
+      setStarRating(f, row, nextRating(cur, Number(star.dataset.val)));
+      return;
+    }
+    if (actionBtn) {
+      e.stopPropagation();
+      const action = actionBtn.dataset.action;
+      // `⋯` is the only action that is about the ROW rather than the file: it
+      // opens the sheet holding the controls the width budget pushed out.
+      if (action === "more") openMoreSheet(card, f);
+      else if(action === "preview")openViewer(f);
+      else runCardAction(action, f, actionBtn);
+      return;
+    }
+    // In select mode a card tap toggles selection instead of opening.
+    if (selectMode && canWriteFile(f)) {
+      toggleSelectionAt(idx);
+      return;
+    }
+    openViewer(f);
+  });
+
+  // ---- Touch gestures: long-press → select mode; drag over ☑ → range select
+  let suppressClick = false;
+  let dragSel: {
+    on: boolean;
+    last: number;
+    moved: boolean;
+    /** The element capture was taken on, so the release targets the same node. */
+    captureOn: Element | null;
+  } | null = null;
+  let lpTimer: ReturnType<typeof setTimeout> | null = null;
+  let lpX = 0;
+  let lpY = 0;
+
+  function cancelLongPress(): void {
+    if (lpTimer) {
+      clearTimeout(lpTimer);
+      lpTimer = null;
+    }
+  }
+
+  gridEl.addEventListener("pointerdown", (e) => {
+    // A suppress flag can go stale when its gesture never produces a click
+    // (long-press followed by a scroll) — a new gesture always starts clean.
+    suppressClick = false;
+    if (!canSelectHere()) return;
+    if(e.shiftKey || (options.compact && e.pointerType === "mouse"))return;
+    // Secondary mouse buttons never select — and must not arm the long-press,
+    // or the contextmenu guard below would eat desktop right-click.
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    const target = e.target as HTMLElement;
+    const card = target.closest(".ib-card.is-file") as HTMLElement | null;
+    if (!card) return;
+    const idx = Number(card.dataset.idx);
+    if (!Number.isFinite(idx)) return;
+    const checkEl = target.closest("[data-check]") as HTMLElement | null;
+    if (checkEl) {
+      // Drag starting on a checkbox sweeps a range; the checkbox has
+      // touch-action:none so the gesture selects instead of scrolling.
+      //
+      // CAPTURE ON THE CHECKBOX, NEVER ON `gridEl`. Pointer Events L3
+      // §4.2.12.3: a `click` whose `pointerup` was dispatched while capture was
+      // held is delivered to the CAPTURING ELEMENT, not to the common ancestor
+      // of the down/up targets — and the spec note says this holds even once
+      // `lostpointercapture` has fired, so releasing in `endPointerGesture`
+      // below is too late by construction. Capturing on the grid therefore
+      // retargeted every tap's click to `gridEl`, where the handler's
+      // `target.closest(".ib-card")` is null and it returns long before the
+      // `[data-check]` branch that was meant to toggle. A plain tap did
+      // nothing; only a drag selected, because `pointermove` applies the range
+      // directly. Capturing on the button leaves the click on the button, so
+      // the branch is reachable and one route (`click`) still serves mouse,
+      // touch and keyboard alike.
+      //
+      // Captured events still BUBBLE to `gridEl`, so the `pointermove` and
+      // `endPointerGesture` listeners below are unchanged and a drag that
+      // leaves the card still sweeps.
+      const f = renderedFiles[idx];
+      dragSel = { on: !(f && isSelected(f)), last: idx, moved: false, captureOn: null };
+      try {
+        checkEl.setPointerCapture(e.pointerId);
+        dragSel.captureOn = checkEl;
+      } catch {
+        /* jsdom implements no pointer capture — the drag path works without it */
+      }
+      return;
+    }
+    // Long-press anywhere on the card enters select mode (Google-Photos
+    // style). Touch/pen only — desktop has hover checkboxes and a slow mouse
+    // click must stay a click.
+    if (e.pointerType === "mouse") return;
+    lpX = e.clientX;
+    lpY = e.clientY;
+    cancelLongPress();
+    lpTimer = setTimeout(() => {
+      lpTimer = null;
+      suppressClick = true;
+      if (!selectMode) setSelectMode(true);
+      toggleSelectionAt(idx);
+    }, 450);
+  });
+
+  gridEl.addEventListener("pointermove", (e) => {
+    if (dragSel) {
+      if (!dragSel.moved) {
+        dragSel.moved = true;
+        setSelectedRange(dragSel.last, dragSel.last, dragSel.on);
+      }
+      const el = document.elementFromPoint(e.clientX, e.clientY);
+      const card =
+        el instanceof Element ? (el.closest(".ib-card.is-file") as HTMLElement | null) : null;
+      if (card) {
+        const idx = Number(card.dataset.idx);
+        if (Number.isFinite(idx) && idx !== dragSel.last) {
+          // Cover the whole span since the last event so a fast swipe can't
+          // skip cards between two pointermove samples.
+          setSelectedRange(dragSel.last, idx, dragSel.on);
+          dragSel.last = idx;
+        }
+      }
+      return;
+    }
+    // A real scroll/pan cancels the pending long-press.
+    if (lpTimer && (Math.abs(e.clientX - lpX) > 8 || Math.abs(e.clientY - lpY) > 8)) {
+      cancelLongPress();
+    }
+  });
+
+  function endPointerGesture(e: PointerEvent): void {
+    if (dragSel) {
+      // A swept range already applied — the trailing click must not re-toggle.
+      if (dragSel.moved) suppressClick = true;
+      const captureOn = dragSel.captureOn;
+      dragSel = null;
+      try {
+        captureOn?.releasePointerCapture(e.pointerId);
+      } catch {
+        /* capture may never have been taken */
+      }
+    }
+    cancelLongPress();
+  }
+  gridEl.addEventListener("pointerup", endPointerGesture);
+  gridEl.addEventListener("pointercancel", endPointerGesture);
+  // Long-press on a thumbnail also raises the native context menu (esp. on
+  // Android over <img>) — swallow it while it would fight the selection UX.
+  gridEl.addEventListener("contextmenu", (e) => {
+    if (selectMode || suppressClick || lpTimer) e.preventDefault();
+  });
+
+  // ---- File actions ---------------------------------------------
+  // Every handler takes the ListingFile (not a bare name) so it addresses the
+  // right file in flat view, where names repeat across subfolders. fileSub(f)
+  // resolves the file's real subfolder; view updates filter by object identity
+  // (x !== f) so a same-named sibling in another folder is never touched.
+  function setStarRating(f: ListingFile, row: HTMLElement, next: number): void {
+    const prev = Number(row.dataset.rating || "0");
+    applyStars(row, next);
+    persistRating(f, next, prev).then(
+      (confirmed) => {
+        if (confirmed !== next) applyStars(row, confirmed);
+      },
+      () => applyStars(row, prev),
+    );
+  }
+
+  /**
+   * Write a rating and keep `f.rating` in step with the server. Shared by the
+   * card's star row and the lightbox's, so both surfaces land the same value
+   * on the file object the grid repaints from. Rejects after reporting.
+   */
+  function persistRating(f: ListingFile, next: number, prev: number): Promise<number> {
+    f.rating = next;
+    const addr: RatingAddress = {
+      type: fileType(f),
+      subfolder: fileSub(f),
+      absDir: state.absPath,
+      name: f.name,
+    };
+    return postRating(RATING_URL, addr, next).then(
+      (confirmed) => {
+        f.rating = confirmed;
+        return confirmed;
+      },
+      (e) => {
+        reportError("Rating failed", e);
+        f.rating = prev;
+        throw e;
+      },
+    );
+  }
+
+  /**
+   * Add or remove the Safe View keyword on one file's `dc:subject`.
+   *
+   * Takes the file OBJECT for the same reason `setStarRating` does — a name
+   * lookup addresses the wrong file in flat view — and re-renders on success
+   * rather than patching the button: marking a file is exactly the event that
+   * should make it blur, and the reveal set has not been touched, so it does.
+   *
+   * THE REPAINT USES WHAT THE SERVER STORED, never the optimistic local guess.
+   * `postTag` resolves to the keywords read back off the file after the write,
+   * and the two differ whenever the file already carried the keyword under a
+   * different casing or the write landed in the sidecar. Assigning `next` here
+   * would paint a mark the file does not carry — and the next `/list` would
+   * silently correct it, which is the worst version of the bug because it looks
+   * like it worked.
+   *
+   * The button is disabled for the duration. It flips server-side state, so a
+   * double tap is a second write racing the first and the loser decides what
+   * the file ends up carrying.
+   */
+  async function toggleSensitiveTag(f: ListingFile, btn: HTMLElement): Promise<void> {
+    const keyword = sensitiveKeyword(readSafeViewConfig());
+    if (!keyword) return; // no configured keyword — the button should not exist
+    // Defensive, exactly like the star handler's: the control only renders for
+    // a card whose OWN root is sandboxed, and this keeps a stale DOM from
+    // posting a write the backend would reject anyway.
+    if (!canWriteFile(f)) return;
+    const next = !hasSensitiveTag(f, keyword);
+    const button = btn as HTMLButtonElement;
+    button.disabled = true;
+    try {
+      f.tags = await postTag(
+        TAG_URL,
+        { type: fileType(f), subfolder: fileSub(f), name: f.name },
+        keyword,
+        next,
+      );
+      renderGrid();
+    } catch (e) {
+      reportError(next ? "Not marked" : "Not unmarked", e);
+      button.disabled = false;
+    }
+  }
+
+  /**
+   * Run one card action. Extracted from the grid's click handler so the
+   * overflow sheet drives the SAME dispatch rather than a parallel copy — a
+   * second switch is how a control ends up doing something subtly different
+   * depending on which surface it was tapped from.
+   */
+  function runCardAction(action: string | undefined, f: ListingFile, btn: HTMLElement): void {
+    if (action === "open") openFull(f);
+    else if (action === "meta") void openMetadata(f);
+    else if (action === "workflow") void loadWorkflow(f);
+    else if (action === "delete") onDelete(f);
+    else if (action === "rename") onRename(f);
+    else if (action === "move") onMove(f);
+    else if (action === "pin") void toggleFilePin(f);
+    else if (action === "marksensitive") void toggleSensitiveTag(f, btn);
+  }
+
+  /**
+   * The overflow sheet: the controls the row's width budget pushed out, as
+   * full-width rows at the touch floor.
+   *
+   * Built from the card's own stash (see `actionRowHTML`), so it offers exactly
+   * the controls that card offers — including their live pressed state — and
+   * cannot drift from the row's gating.
+   *
+   * The sheet closes BEFORE the action runs, so the result is visible: every
+   * one of these either opens its own overlay (rename / move / delete / meta),
+   * repaints the grid (pin / mark), or leaves the modal (workflow). The button
+   * handed to `runCardAction` is the sheet's row, which is detached by then —
+   * that only costs `toggleSensitiveTag` its in-flight `disabled` styling, and
+   * the outcome still lands on the card via its `renderGrid()`.
+   */
+  function openMoreSheet(card: HTMLElement, f: ListingFile): void {
+    const stashed = Array.from(card.querySelectorAll<HTMLElement>(".ib-more-stash [data-action]"));
+    if (!stashed.length) return;
+    const ov = openShellOverlay(modal);
+    ov.card.classList.add("ib-more-card");
+    // No pressed/filled state is carried into a row, because no STATEFUL
+    // control ever reaches the sheet: 📌 and 🙈 lead the priority order
+    // precisely so their state stays legible on the card, and
+    // tests/js/card-actions.test.js asserts that across every card shape the
+    // pack renders. Reading a state here that cannot arrive would be an
+    // untested branch pretending to be defensive.
+    const rows = stashed
+      .map((b) => {
+        const action = b.dataset.action ?? "";
+        const danger = b.classList.contains("ib-act-danger") ? " ib-more-danger" : "";
+        return `<button type="button" class="ib-more-row${danger}" data-action="${escHTML(action)}">
+          <span class="ib-more-glyph">${escHTML(b.textContent?.trim() || "")}</span>
+          <span>${escHTML(ACTION_LABELS[action] ?? action)}</span>
+        </button>`;
+      })
+      .join("");
+    ov.card.innerHTML = `
+      <div class="cmp-ov-title">${escHTML(f.name)}</div>
+      <div class="ib-more-list">${rows}</div>`;
+    ov.card.addEventListener("click", (e) => {
+      const row = (e.target as HTMLElement).closest(".ib-more-row") as HTMLElement | null;
+      if (!row) return;
+      e.stopPropagation();
+      ov.close();
+      runCardAction(row.dataset.action, f, row);
+    });
+  }
+
+  /**
+   * Gate + reveal shared by both full-size routes. Returns false (after saying
+   * why) when the file cannot be read at all.
+   */
+  function prepareFullOpen(f: ListingFile): boolean {
+    // Opening a file full-size IS the decision to look at it, so it reveals the
+    // card behind it. Without this the user opens a blurred image in a new tab
+    // — unblurred, since the filter is a class on OUR thumbnail and not on the
+    // file — and comes back to a grid still pretending it is hidden, with no
+    // hint that the 👁 is what stops that repeating.
+    if (revealed.has(fileType(f), fileSub(f), f.name)) {
+      // Already revealed — nothing to repaint, and re-rendering here would
+      // discard the focus/scroll state for no visible change.
+    } else if (isCardHidden(f, readSafeViewConfig())) {
+      revealed.reveal(fileType(f), fileSub(f), f.name);
+      renderGrid();
+    }
+    // Opening an absolute-path file also goes through /image_browser/file, so
+    // with the opt-in off this would open onto a 403 JSON body. Say why here
+    // rather than in a view the user has to read and close.
+    if (fileType(f) === "path" && !pathReadsAllowed()) {
+      notify({
+        severity: "warn",
+        summary: "Absolute-path reads are off",
+        detail: PATH_READS_DISABLED_MSG,
+      });
+      return false;
+    }
+    return true;
+  }
+
+  /** The ↗ action: the original file in a new browser tab. */
+  function openFull(f: ListingFile): void {
+    if (!prepareFullOpen(f)) return;
+    const url = fullSrcURL(fileType(f), fileSub(f), f.name, state.absPath);
+    window.open(url, "_blank", "noopener");
+  }
+
+  /**
+   * A card tap: the in-browser lightbox (src/lightbox.ts), stepping through
+   * `renderedFiles` — the grid's current order and filter.
+   *
+   * Only the file the user TAPPED is revealed. A Safe View match reached by
+   * arrowing through arrives blurred with its own 👁, because stepping onto a
+   * file is not a decision to look at it.
+   */
+  function openViewer(f: ListingFile): void {
+    if (!prepareFullOpen(f)) return;
+    const rated = new Set<ListingFile>();
+    openLightbox<ListingFile>(f, {
+      shell: modal,
+      files: () => renderedFiles,
+      name: (x) => x.name,
+      kind: (x) => {
+        const ext = (x.ext || "").toLowerCase();
+        return IMG_EXTS.has(ext) ? "image" : VIDEO_EXTS.has(ext) ? "video" : "other";
+      },
+      src: (x) =>
+        fileType(x) === "path" && !pathReadsAllowed()
+          ? { blocked: PATH_READS_DISABLED_MSG }
+          : { url: fullSrcURL(fileType(x), fileSub(x), x.name, state.absPath) },
+      rating: (x) => (canWriteFile(x) ? ratingOf(x) : null),
+      rate: (x, next) => {
+        rated.add(x);
+        return persistRating(x, next, ratingOf(x));
+      },
+      canDelete: (x) => canWriteFile(x),
+      remove: (x) => onDelete(x),
+      hidden: (x) => isCardHidden(x, readSafeViewConfig()),
+      reveal: (x) => {
+        revealed.reveal(fileType(x), fileSub(x), x.name);
+        renderGrid();
+      },
+      openInTab: (x) => openFull(x),
+      onClose: (last) => {
+        // Stars set in the viewer, onto the cards underneath. ratingOf reads
+        // the value persistRating settled on, not the optimistic one.
+        for (const x of rated) {
+          const i = renderedFiles.indexOf(x);
+          const row = gridEl.querySelector<HTMLElement>(`.ib-card[data-idx="${i}"] .ib-stars`);
+          if (i >= 0 && row) applyStars(row, ratingOf(x));
+        }
+        // Leave keyboard focus on the file the user was last looking at.
+        const i = last ? renderedFiles.indexOf(last) : -1;
+        if (i >= 0) {
+          focusIndex = i;
+          applyFocus();
+        }
+      },
+    });
+  }
+
+  // Copy feedback lives on the button itself: label → "Copied ✓" → back.
+  // DELIBERATELY no notify() toast on success — the toast stack is a child of
+  // <body> above the dialog, so on the installed kit a toast raised over an open
+  // overlay parks its ✕ on top of the shell's, and tapping it dismisses the whole
+  // browser. The label flip is also the clearer confirmation: it names which
+  // field went to the clipboard. copyTextToClipboard (not navigator.clipboard
+  // directly) carries the non-secure-context fallback plain-http LAN ComfyUI needs.
+  //
+  // `restore` is PASSED IN, never read back off the button: reading
+  // btn.textContent at click time captures the TRANSIENT label whenever a second
+  // click lands inside the 1500 ms window, so the feedback latches permanently —
+  // and in the fail-then-succeed order the button settles on "Copy failed" after
+  // a copy that worked, i.e. it lies about whether the value is on the clipboard.
+  // One feedback slot per button (copyFeedback): a new click supersedes the
+  // previous click's pending restore AND its late-resolving promise (the `seq`
+  // check), so the label always shows the LAST copy's outcome and then `restore`.
+  const copyFeedback = new WeakMap<
+    HTMLButtonElement,
+    { seq: number; timer: ReturnType<typeof setTimeout> | null }
+  >();
+  function copyInto(btn: HTMLButtonElement, text: string, restore: string): void {
+    let fb = copyFeedback.get(btn);
+    if (!fb) {
+      fb = { seq: 0, timer: null };
+      copyFeedback.set(btn, fb);
+    }
+    const slot = fb;
+    const seq = ++slot.seq;
+    // Hold the current feedback until this copy answers — no flicker back to
+    // `restore` mid-flight — but drop the stale restore timer that would fire
+    // out of order once this click's own timer is armed.
+    if (slot.timer !== null) {
+      clearTimeout(slot.timer);
+      slot.timer = null;
+    }
+    void copyTextToClipboard(text).then((ok) => {
+      if (slot.seq !== seq) return; // a later click owns the label now
+      btn.textContent = ok ? "Copied ✓" : "Copy failed";
+      btn.classList.toggle("is-copied", ok);
+      slot.timer = setTimeout(() => {
+        slot.timer = null;
+        btn.textContent = restore;
+        btn.classList.remove("is-copied");
+      }, 1500);
+    });
+  }
+
+  // Load the graph embedded in an image onto the canvas.
+  //
+  // Two-step on purpose. The /metadata READ is the gate: it seeks past the pixel
+  // data to reach the text chunks, so asking "is there a graph?" costs a fraction
+  // of the full-size bytes, and — more importantly — it lets a workflow-less image
+  // get an honest message. handleFile()'s own no-workflow path is a quiet return,
+  // which would read to the user as a dead button rather than as "this PNG has no
+  // graph in it". Only once the gate passes do we fetch the bytes and hand the
+  // File to ComfyUI's OWN loader, which is also what a drag-and-drop onto the
+  // canvas calls — so workflow-vs-prompt precedence, API-format reconstruction
+  // and the missing-node-types dialog all come from the app, not from us.
+  //
+  // The browser closes first: loadGraphData swaps the canvas underneath, and
+  // leaving a full-viewport modal parked over the graph the user just asked to
+  // see is the wrong end state.
+  async function loadWorkflow(f: ListingFile): Promise<void> {
+    const sub = fileSub(f);
+    const type = fileType(f);
+    try {
+      const meta = await fetchMetadata(type, sub, f.name, state.absPath);
+      const graphJSON = embeddedWorkflowJSON(meta);
+      if (!graphJSON) {
+        notify({
+          severity: "warn",
+          summary: "No workflow in this file",
+          detail: `${f.name} carries no embedded graph. Files saved by another tool (or re-encoded, e.g. by a phone gallery or a chat app) lose ComfyUI's metadata.`,
+        });
+        return;
+      }
+      // Videos take a different route to the SAME app loader, because
+      // handing the video bytes to handleFile() is not reliable for them.
+      // getWorkflowDataFromFile() reads the mdta `keys`+`ilst` MP4 layout core
+      // SaveVideo writes, but returns early when the `keys` box is absent —
+      // which is exactly how kijai's writers store it (a bare `©cmt` atom
+      // holding a double-encoded envelope; 26% of the videos on the reference
+      // install, verified by walking their box trees). handleFile's
+      // no-workflow branch then PASTES A LoadVideo NODE rather than loading
+      // the graph: a silently wrong outcome, worse than the dead button this
+      // change removes.
+      //
+      // So a video hands over the graph the BACKEND already parsed, as a JSON
+      // file. That still goes through app.handleFile → getDataFromJSON, which
+      // owns the lenient non-finite parse, the API-vs-UI format detection, and
+      // the workflow/prompt precedence — none of which is reimplemented here.
+      // A malformed graph ends at the app's own showErrorOnFileLoad, never at
+      // a pasted node. Images keep the byte path: it is unchanged, and their
+      // containers are ones handleFile reads natively.
+      if (META_VIDEO_EXTS.has((f.ext || "").toLowerCase())) {
+        // handleFile names the workflow tab after the file, minus one
+        // extension — so ".json" here would leave the video's own extension
+        // showing. Strip it first and let the graph tab carry the bare name.
+        const base = f.name.replace(/\.[^./]+$/, "");
+        const file = new File([graphJSON], `${base}.json`, { type: "application/json" });
+        modal.close();
+        await app.handleFile(file);
+        return;
+      }
+      // Images take the byte path, and on the browse…/path tab those bytes
+      // come from /image_browser/file — which is behind the absolute-path
+      // opt-in. Without this the ⤓ button and the `w` shortcut surfaced a bare
+      // "HTTP 403" that never named the setting; openFull already says it
+      // properly, and this is the second route to the same endpoint.
+      if (type === "path" && !pathReadsAllowed()) {
+        notify({
+          severity: "warn",
+          summary: "Absolute-path reads are off",
+          detail: PATH_READS_DISABLED_MSG,
+        });
+        return;
+      }
+      const res = await fetch(fullSrcURL(type, sub, f.name, state.absPath));
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      // handleFile keys the workflow's tab name off file.name, so pass the real
+      // filename rather than a synthesized one.
+      const file = new File([blob], f.name, { type: blob.type });
+      modal.close();
+      await app.handleFile(file);
+    } catch (e) {
+      notify({
+        severity: "error",
+        summary: "Could not load workflow",
+        detail: `${f.name}: ${e instanceof Error ? e.message : String(e)}`,
+      });
+    }
+  }
+
+  // Embedded generation metadata for one image, in an IN-DIALOG overlay
+  // (openShellOverlay — a second openModalShell would break single-modal
+  // discipline and close the browser under itself).
+  async function openMetadata(f: ListingFile): Promise<void> {
+    // The overlay is dismissible while the read is in flight, so a late response
+    // must not paint into a closed card.
+    let live = true;
+    const ov = openShellOverlay(modal, {
+      onDismiss: () => {
+        live = false;
+      },
+    });
+    ov.card.classList.add("ib-meta-card");
+    const close = (): void => {
+      live = false;
+      ov.close();
+    };
+    const title = `Metadata — ${escHTML(f.name)}`;
+    // Painted synchronously: an overlay that appears only after the read would
+    // feel like a dead button on a big file / slow disk.
+    ov.card.innerHTML = `
+      <div class="cmp-ov-title">${title}</div>
+      <div class="ib-meta-body"><div class="ib-meta-status">Reading metadata…</div></div>
+      <div class="cmp-ov-actions">
+        <button type="button" class="cmp-ov-btn" data-meta-close>Close</button>
+      </div>`;
+    ov.card.querySelector("[data-meta-close]")?.addEventListener("click", close);
+
+    let data: ImageMetadata;
+    try {
+      data = await fetchMetadata(fileType(f), fileSub(f), f.name, state.absPath);
+    } catch (e) {
+      // Close FIRST, then report: the copyable error toast must not land on an
+      // open overlay (same toast-over-dialog constraint as copyInto above).
+      close();
+      reportError("Metadata read failed", e);
+      return;
+    }
+    if (!live) return;
+
+    const rows: MetaRow[] = metaRows(data.summary);
+    const rawKeys = Object.keys(data.raw);
+    const srcLabel =
+      data.source === "comfyui"
+        ? "ComfyUI"
+        : data.source === "a1111"
+          ? "A1111"
+          : "no generation data";
+    const rowsHTML = rows
+      .map(
+        (r, i) => `
+        <div class="ib-meta-row">
+          <div class="ib-meta-k">${escHTML(r.label)}</div>
+          <div class="ib-meta-v">${escHTML(r.value)}</div>
+          <button type="button" class="ib-meta-copy" data-copy-row="${i}">Copy</button>
+        </div>`,
+      )
+      .join("");
+    // Never invent a row. With nothing recognised the honest report is which of
+    // the two cases it is: no embedded text at all, or text we couldn't map (in
+    // which case the raw disclosure below is the whole answer).
+    const emptyHTML = rows.length
+      ? ""
+      : `<div class="ib-meta-empty">${
+          rawKeys.length ? "No recognised generation parameters." : "No generation metadata found."
+        }</div>`;
+    const rawJSON = JSON.stringify(data.raw, null, 2);
+    const rawHTML = rawKeys.length
+      ? `
+        <details class="ib-meta-raw">
+          <summary>Raw metadata (${rawKeys.length} key${rawKeys.length === 1 ? "" : "s"})</summary>
+          <pre>${escHTML(rawJSON)}</pre>
+          <button type="button" class="ib-meta-copy" data-copy-raw>Copy JSON</button>
+        </details>`
+      : "";
+    const noteHTML = data.truncated
+      ? `<div class="ib-meta-note">Some values were truncated by the server.</div>`
+      : "";
+    const copyAll = rows.length
+      ? `<button type="button" class="cmp-ov-btn cmp-ov-primary" data-copy-all>Copy all</button>`
+      : "";
+    ov.card.innerHTML = `
+      <div class="cmp-ov-title">${title}</div>
+      <div class="ib-meta-body">
+        <div class="ib-meta-src">${escHTML(srcLabel)}${
+          data.format ? `<span class="ib-meta-fmt">${escHTML(data.format)}</span>` : ""
+        }</div>
+        ${emptyHTML}
+        ${rowsHTML}
+        ${noteHTML}
+        ${rawHTML}
+      </div>
+      <div class="cmp-ov-actions">
+        ${copyAll}
+        <button type="button" class="cmp-ov-btn" data-meta-close>Close</button>
+      </div>`;
+    ov.card.querySelector("[data-meta-close]")?.addEventListener("click", close);
+    // Each restore label is read ONCE here, off the freshly painted markup —
+    // never inside the click handler, where a mid-feedback label would stick.
+    for (const btn of ov.card.querySelectorAll<HTMLButtonElement>("[data-copy-row]")) {
+      const row = rows[Number(btn.dataset.copyRow)];
+      const label = btn.textContent || "Copy";
+      if (row) btn.addEventListener("click", () => copyInto(btn, row.value, label));
+    }
+    const rawBtn = ov.card.querySelector<HTMLButtonElement>("[data-copy-raw]");
+    const rawLabel = rawBtn?.textContent || "Copy JSON";
+    rawBtn?.addEventListener("click", () => copyInto(rawBtn, rawJSON, rawLabel));
+    const allBtn = ov.card.querySelector<HTMLButtonElement>("[data-copy-all]");
+    const allLabel = allBtn?.textContent || "Copy all";
+    allBtn?.addEventListener("click", () => copyInto(allBtn, metaClipboardText(rows), allLabel));
+  }
+
+  /** Resolves true only when the file was deleted (the lightbox advances on it). */
+  async function onDelete(f: ListingFile): Promise<boolean> {
+    const ok = await confirmInShell(modal, {
+      title: "Delete file?",
+      message: `Permanently delete "${f.name}"? This cannot be undone.`,
+      confirmLabel: "Delete",
+      danger: true,
+    });
+    if (!ok) return false;
+    const pin = filePinItem(f);
+    try {
+      await deleteFile(fileType(f), fileSub(f), f.name);
+      // The file is gone, so its pin is a dead address — drop it in the SAME
+      // handler rather than leaving it for the user to prune. (Out-of-band
+      // deletions, from the other pack or over ssh, still fall to dimmed +
+      // prune: there is no watcher and we are not adding one.)
+      await followPins([{ from: pin, to: null }]);
+      state.files = state.files.filter((x) => x !== f);
+      renderGrid();
+      return true;
+    } catch (e) {
+      reportError("Delete failed", e);
+      return false;
+    }
+  }
+
+  async function onRename(f: ListingFile): Promise<void> {
+    const name = f.name;
+    const dot = name.lastIndexOf(".");
+    const ext = dot >= 0 ? name.slice(dot) : "";
+    const newName = await promptInShell(modal, {
+      title: "Rename file",
+      label: "New filename",
+      value: name,
+      confirmLabel: "Rename",
+      validate: (v) => {
+        if (!v) return "Filename required";
+        if (v.includes("/") || v.includes("\\")) return "No slashes allowed";
+        if (v === "." || v === "..") return "Invalid name";
+        if (ext && !v.toLowerCase().endsWith(ext.toLowerCase())) return `Keep the ${ext} extension`;
+        return null;
+      },
+    });
+    if (!newName || newName === name) return;
+    const from = filePinItem(f);
+    try {
+      await renameFile(fileType(f), fileSub(f), name, newName);
+      // A pin addresses a file BY NAME, so a rename must carry the pin with it
+      // or the user's pin silently becomes a dangling one.
+      await followPins([{ from, to: { ...from, name: newName } }]);
+      f.name = newName;
+      renderGrid();
+    } catch (e) {
+      reportError("Rename failed", e);
+    }
+  }
+
+  async function onMove(f: ListingFile): Promise<void> {
+    const dest = await pickDestination(modal, {
+      type: fileType(f),
+      subfolder: fileSub(f),
+    });
+    if (!dest) return;
+    const from = filePinItem(f);
+    try {
+      await moveFile(fileType(f), fileSub(f), f.name, dest.type, dest.subfolder);
+      saveDest(dest);
+      // Same reasoning as rename: the pin's address changed, so re-point it.
+      await followPins([
+        { from, to: { kind: "file", type: dest.type, subfolder: dest.subfolder, name: f.name } },
+      ]);
+      state.files = state.files.filter((x) => x !== f);
+      renderGrid();
+      notify({
+        severity: "success",
+        summary: "Moved",
+        detail: `"${f.name}" → ${dest.type}${dest.subfolder ? `/${dest.subfolder}` : ""}`,
+      });
+    } catch (e) {
+      reportError("Move failed", e);
+    }
+  }
+
+  // ---- Pins ------------------------------------------------------
+  //
+  // Every mutation here is ONE delta whose response is the whole list, so each
+  // helper refreshes the module cache from what came back rather than patching
+  // it locally — a local patch would diverge the moment the other pack (or the
+  // other device) touched the same store between two of our calls.
+
+  /**
+   * Repaint the per-card 📌 state IN PLACE.
+   *
+   * Deliberately not a renderGrid(): a re-render captures and then re-asserts a
+   * scroll offset for ~200 ms (see the scroll-restore block), so running one at
+   * an unpredictable moment — e.g. when the initial pin fetch happens to land
+   * mid-restore — would collapse an in-flight restore onto whatever the
+   * scroller had reached. Only the buttons can have changed, so only the
+   * buttons are touched.
+   */
+  function refreshPinButtons(): void {
+    for (const [i, c] of fileCards().entries()) {
+      const f = renderedFiles[i];
+      const btn = c.querySelector<HTMLElement>('[data-action="pin"]');
+      if (!f || !btn) continue;
+      const on = isPinned(filePinItem(f));
+      btn.classList.toggle("is-pinned", on);
+      btn.title = on ? "Unpin this file" : "Pin this file";
+    }
+  }
+
+  /** Repaint whatever the current view shows pins through. */
+  async function refreshPinnedUI(): Promise<void> {
+    if (isPinnedView()) {
+      // The pinned view IS the pin list — re-list it (which re-resolves every
+      // entry's `exists` and stats) rather than trying to splice a card out.
+      await loadAndRender({ preserveScroll: true });
+      return;
+    }
+    renderPins();
+    refreshPinButtons();
+  }
+
+  async function toggleFolderPinHere(): Promise<void> {
+    if (!SANDBOXED_TYPES.includes(state.type)) return;
+    const item: PinItem = { kind: "dir", type: state.type, subfolder: state.subfolder };
+    const pinned = isPinned(item);
+    try {
+      setPinCache((await postPinDelta(pinned ? "remove" : "add", item)).pins);
+      renderPins();
+    } catch (e) {
+      // Surfaces the backend's own refusal verbatim — notably
+      // "pin limit reached (max 200)", which must never be a silent no-op.
+      reportError(pinned ? "Unpin failed" : "Pin failed", e);
+    }
+  }
+
+  async function unpinFolder(item: PinItem): Promise<void> {
+    try {
+      setPinCache((await postPinDelta("remove", item)).pins);
+      renderPins();
+    } catch (e) {
+      reportError("Unpin failed", e);
+    }
+  }
+
+  async function toggleFilePin(f: ListingFile): Promise<void> {
+    // Pins address sandboxed roots only — the same perimeter as every write —
+    // so a browse…/path card has no 📌 and this defends a stale DOM.
+    if (!canWriteFile(f)) return;
+    const item = filePinItem(f);
+    const pinned = isPinned(item);
+    try {
+      setPinCache((await postPinDelta(pinned ? "remove" : "add", item)).pins);
+      await refreshPinnedUI();
+    } catch (e) {
+      reportError(pinned ? "Unpin failed" : "Pin failed", e);
+    }
+  }
+
+  async function doPinSelected(): Promise<void> {
+    const items = collectSelectedOrFocused();
+    if (items.length === 0) return;
+    let added = 0;
+    // Deduped: once the store is full EVERY remaining add fails with the same
+    // sentence, and N copies of it in one toast is noise, not information.
+    const failures = new Set<string>();
+    // Sequential, not Promise.all: each delta is a read-modify-write of one
+    // shared file, and the response of each is the list the next one's result
+    // must be read against.
+    for (const it of items) {
+      try {
+        const res = await postPinDelta("add", {
+          kind: "file",
+          type: it.type,
+          subfolder: it.subfolder,
+          name: it.name,
+        });
+        setPinCache(res.pins);
+        added++;
+      } catch (e) {
+        failures.add(e instanceof Error ? e.message : String(e));
+      }
+    }
+    await refreshPinnedUI();
+    if (failures.size > 0) {
+      reportError(
+        `Pinned ${added}, ${items.length - added} failed`,
+        new Error(Array.from(failures).join("; ")),
+      );
+      return;
+    }
+    notify({ severity: "success", summary: "Pinned", detail: `${added} file(s)` });
+  }
+
+  async function onPruneMissing(): Promise<void> {
+    const before = pinEntries.length;
+    try {
+      const res = await postPinDelta("prune");
+      const removed = before - res.pins.length;
+      setPinCache(res.pins);
+      await refreshPinnedUI();
+      notify({
+        severity: "success",
+        summary: "Pins pruned",
+        detail: `${removed} missing pin(s) removed`,
+      });
+    } catch (e) {
+      reportError("Prune failed", e);
+    }
+  }
+
+  /**
+   * Carry pins across a mutation this pack just performed.
+   *
+   * `to: null` drops the pin (a delete); otherwise the pin is removed at its old
+   * address and re-added at the new one. Entries that were never pinned cost
+   * nothing — the check is against the local key set, not a request.
+   *
+   * This covers ONLY changes made through this pack. A file moved from the
+   * sibling pack, or renamed over ssh, cannot notify us: there is no watcher and
+   * we are deliberately not adding one. Those pins go stale, render dimmed, and
+   * leave via "Prune missing".
+   */
+  async function followPins(changes: { from: PinItem; to: PinItem | null }[]): Promise<void> {
+    const live = changes.filter((c) => isPinned(c.from));
+    if (live.length === 0) return;
+    try {
+      for (const c of live) {
+        setPinCache((await postPinDelta("remove", c.from)).pins);
+        if (c.to) setPinCache((await postPinDelta("add", c.to)).pins);
+      }
+      renderPins();
+    } catch (e) {
+      // The mutation itself already succeeded; say so plainly rather than
+      // letting the caller's catch report the file operation as failed.
+      reportError("Pin list not updated for this change", e);
+    }
+  }
+
+  // ---- Render ----------------------------------------------------
+  function renderTabs(): void {
+    for (const b of tabsEl.querySelectorAll(".ib-tab")) {
+      b.classList.toggle("is-active", (b as HTMLElement).dataset.type === state.type);
+    }
+    // The browse…/path tab is read-only — no selection to toggle and no folder
+    // to create there (both are sandboxed writes). Flat view is likewise
+    // sandboxed-only, so its toggle hides there too.
+    //
+    // The pinned view is neither: it is not a directory, so ≣ (fold this
+    // subtree), 📁+ (create here) and 📌 (pin this folder) have nothing to
+    // operate on and stay hidden — but its cards ARE writable, so multi-select
+    // stays. That split is why the location-level flag below is not the same
+    // predicate as the per-card canWriteFile().
+    const canWrite = SANDBOXED_TYPES.includes(state.type);
+    selectToggleEl.style.display = canSelectHere() ? "" : "none";
+    newFolderEl.style.display = canWrite ? "" : "none";
+    uploadEl.style.display = canWrite ? "" : "none";
+    viewToggleEl.style.display = canWrite ? "" : "none";
+    viewToggleEl.classList.toggle("is-active", isFlat());
+    viewToggleEl.title = isFlat() ? "Folder view" : "Flat view (all subfolders)";
+    // No display gate for the filter: it is a read-side narrowing that works on
+    // every tab, browse…/path included.
+    for (const b of filterGroupEl.querySelectorAll(".ib-filter-seg")) {
+      b.classList.toggle("is-active", (b as HTMLElement).dataset.filter === state.typeFilter);
+    }
+  }
+
+  function renderPins(): void {
+    const pins = folderPins();
+    const canPin = SANDBOXED_TYPES.includes(state.type);
+    pinToggleEl.style.display = canPin ? "" : "none";
+    const herePinned =
+      canPin && isPinned({ kind: "dir", type: state.type, subfolder: state.subfolder });
+    pinToggleEl.classList.toggle("is-active", herePinned);
+    pinToggleEl.title = herePinned ? "Unpin this folder" : "Pin this folder";
+    // Prune is offered only where it means something AND only while there is
+    // something to prune — an always-on button that usually removes nothing
+    // reads as broken. Set here rather than in renderTabs because the answer
+    // depends on the pin list, which lands after renderTabs has already run.
+    pruneEl.style.display =
+      isPinnedView() && pinEntries.some((p) => p.exists === false) ? "" : "none";
+    pinsEl.innerHTML = "";
+    pinsEl.style.display = pins.length ? "" : "none";
+    for (const p of pins) {
+      const chip = document.createElement("span");
+      chip.className = "ib-pin-chip";
+      chip.dataset.pinType = p.type;
+      chip.dataset.pinSub = p.subfolder;
+      if (p.type === state.type && p.subfolder === state.subfolder)
+        chip.classList.add("is-current");
+      const go = document.createElement("button");
+      go.type = "button";
+      go.className = "ib-pin-go";
+      go.title = `Go to ${pinLabel(p)}`;
+      go.textContent = `📌 ${pinLabel(p)}`;
+      const x = document.createElement("button");
+      x.type = "button";
+      x.className = "ib-pin-x";
+      x.title = `Unpin ${pinLabel(p)}`;
+      x.textContent = "✕";
+      chip.append(go, x);
+      pinsEl.appendChild(chip);
+    }
+  }
+
+  function renderCrumbs(): void {
+    crumbsEl.innerHTML = "";
+    const mk = (text: string, attr: string, value: string) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "ib-crumb";
+      b.setAttribute(attr, value);
+      b.textContent = text;
+      return b;
+    };
+    if (state.type === "path") {
+      crumbsEl.appendChild(mk("/", "data-abs", "/"));
+      let acc = "";
+      for (const p of state.absPath.split("/").filter(Boolean)) {
+        acc = `${acc}/${p}`;
+        crumbsEl.appendChild(mk(p, "data-abs", acc));
+      }
+    } else {
+      crumbsEl.appendChild(mk(options.rootLabel?.(state.type) || state.type, "data-sub", ""));
+      let acc = "";
+      for (const p of state.subfolder.split("/").filter(Boolean)) {
+        acc = acc ? `${acc}/${p}` : p;
+        crumbsEl.appendChild(mk(p, "data-sub", acc));
+      }
+    }
+  }
+
+  // The ticker of the load currently on screen. Loads can overlap (a refresh
+  // while a listing is still out, a scan-poll re-list), so each load keeps its
+  // OWN handle and only clears the shared state while it is still the current
+  // one: an older load landing late must not stop the newer load's counter.
+  let loadTicker: ReturnType<typeof setInterval> | null = null;
+
+  function hideLoadNote(): void {
+    loadNoteEl.hidden = true;
+    loadNoteEl.textContent = "";
+  }
+
+  function cancelLoadTicker(): void {
+    if (loadTicker !== null) {
+      clearInterval(loadTicker);
+      loadTicker = null;
+    }
+    hideLoadNote();
+  }
+
+  /** Start counting this load's wait; returns the stop for THIS load only. */
+  function startLoadTicker(flat: boolean): () => void {
+    cancelLoadTicker();
+    const started = Date.now();
+    modal.setStatus(loadingStatusText(0));
+    const mine = setInterval(() => {
+      const elapsed = Date.now() - started;
+      modal.setStatus(loadingStatusText(elapsed));
+      if (elapsed >= LOAD_NOTE_MS && loadNoteEl.hidden) {
+        loadNoteEl.textContent = flat ? LOAD_NOTE_FLAT : LOAD_NOTE_FOLDER;
+        loadNoteEl.hidden = false;
+      }
+    }, LOAD_TICK_MS);
+    loadTicker = mine;
+    return () => {
+      clearInterval(mine);
+      if (loadTicker === mine) {
+        loadTicker = null;
+        hideLoadNote();
+      }
+    };
+  }
+
+  async function loadAndRender(opts?: { preserveScroll?: boolean; rescan?: boolean }): Promise<void> {
+    if (!modal.dialog.isConnected) return;
+    const generation = ++loadGeneration;
+    modal.dialog.dispatchEvent(new CustomEvent('hub-loading',{detail:{preserve:!!lastQuery && lastQuery.type===state.type && lastQuery.subfolder===state.subfolder && lastQuery.path===state.absPath && lastQuery.query===state.query && lastQuery.kind===state.typeFilter && lastQuery.recursive===isFlat() && lastQuery.sortKey===state.sortKey && lastQuery.sortDir===state.sortDir}}));
+    if (!restoring) focusIndex = 0;
+    visualMode = false;
+    modal.dialog.classList.remove("is-visual");
+    clearPending();
+    // Reveals are scoped to ONE location. Keyed off locationKey() rather than
+    // "any loadAndRender" on purpose: a refresh, a paste and a settings repaint
+    // all re-enter here for the SAME folder and must keep what the user
+    // revealed, while a tab switch, a folder descent or a crumb must not carry
+    // a reveal onto a different listing.
+    const here = locationKey();
+    if (revealLocation !== here) {
+      revealed.clear();
+      revealLocation = here;
+      // A fresh location gets a fresh poll budget. Re-arming per LOAD instead
+      // would make the budget unbounded: each poll is a load, so the poll would
+      // top up the allowance it just spent and never stop.
+      scanPollsLeft = SCAN_POLL_MAX;
+    }
+    renderTabs();
+    renderCrumbs();
+    if(!options.compact)modal.setBusy(true);
+    // Arm the recovery breadcrumb around the whole flat load+render. It is
+    // cleared below once the grid has painted, so only an attempt that never
+    // got there (a tab the render killed) leaves it set.
+    viewStore.markPending(isFlat());
+    // ONE read per load, handed to every match below — the kit's own doc says
+    // to call it once per render pass and not once per card.
+    const safeCfg = readSafeViewConfig();
+    renderSafeToggle(safeCfg);
+    // Started immediately before the try whose finally stops it, so nothing
+    // that can throw sits between the two and leaks a running interval.
+    const stopLoadTicker = startLoadTicker(isFlat());
+    try {
+      if (isPinnedView()) {
+        // The pinned view is not a directory: its grid comes from /pins, and
+        // every card carries its own root (fileType) and subfolder (fileSub).
+        // Everything downstream — renderGrid, ratings, ⓘ/⤓, multi-select, the
+        // write buttons — then works unmodified.
+        const res = await fetchPins();
+        setPinCache(res.pins);
+        state.dirs = [];
+        // Narrowed CLIENT-side, and only here. The reasoning in api.ts's
+        // ListParams.kind — filter on the server, above the cap — does not
+        // apply: /pins has no cap to spend (the store itself is capped at 200
+        // and is always returned whole), so narrowing the response cannot
+        // under-report the way filtering an already-truncated listing would.
+        state.files = narrowByKind(pinsToFiles(res.pins), state.typeFilter);
+        // Safe View's hide, applied CLIENT-side here and only here — the same
+        // exemption narrowByKind takes, for the same reason: /pins has no cap
+        // to spend (the store is capped at 200 and always returned whole), so
+        // dropping entries from the response cannot under-report the way
+        // filtering a truncated /list would. Without this the pinned tab would
+        // be a hole in the filter — pin a sensitive file once and it is listed
+        // in full every time hiding is on.
+        if (safeCfg.hide) {
+          state.files = state.files.filter((f) => !isSensitive(safeTargetOf(f), safeCfg));
+        }
+        // The pinned view has no verdicts to report: /pins carries no
+        // prompt_match, so every pinned card is outside the tier (documented
+        // alongside the narrowByKind exemption). Painting a stale count from
+        // the previous folder would claim a scan that is not running for this
+        // listing.
+        renderScanPill(0);
+        modal.setStatus(res.pins.length ? "" : "Nothing pinned yet.");
+      } else {
+        const query = {type:state.type,subfolder:state.subfolder,path:state.absPath,recursive:isFlat(),kind:state.typeFilter,query:state.query,sortKey:state.sortKey,sortDir:state.sortDir,safeHide:safeCfg.hide,safeKeywords:safeCfg.keywords,safePrompt:safeCfg.matchPrompt};
+        const scope = JSON.stringify(query);
+        if(scope!==pageScope) { restoring=false; pageScope=scope; pageOffset=0; clickAnchor=-1; clearSelection(); }
+        const data = options.listing && state.type!=='path' ? await options.listing({...query,offset:pageOffset,refresh:!!opts?.rescan}) : await fetchListing({
+          type: state.type,
+          subfolder: state.subfolder,
+          path: state.absPath,
+          recursive: isFlat(),
+          kind: state.typeFilter,
+          // Sent only when hiding is actually on AND there is something to
+          // match, so the default request URL stays byte-identical to what it
+          // was before Safe View existed — the same discipline `kind` follows.
+          safeHide: safeCfg.hide,
+          safeKeywords: safeCfg.keywords,
+          // The opt-in prompt tier. Independent of `safeHide`: the two compose,
+          // and blur-only is this tier's default mode as it is for the others.
+          safePrompt: safeCfg.matchPrompt,
+        });
+        if(generation!==loadGeneration || !modal.dialog.isConnected) return;
+        lastListing=data; lastQuery={...query,token:data.token}; pageOffset=data.offset||0;
+        modal.dialog.dispatchEvent(new CustomEvent('hub-list',{detail:{...data,query:lastQuery}}));
+        state.dirs = data.dirs || [];
+        state.files = data.files || [];
+        renderScanPill(data.safe_unscanned ?? 0);
+        modal.setStatus(data.exists ? "" : "Directory not found.");
+        if (data.truncated) {
+          notify({
+            severity: "warn",
+            summary: `Showing the newest ${state.files.length}`,
+            detail:
+              "This folder's subtree has more files than the flat view returns; older ones are not listed.",
+          });
+        }
+      }
+    } catch (e) {
+      // Surface via the copyable notify() popup (reportError) in addition to
+      // the inline status text — a list-load failure was previously
+      // console-only from the user's perspective.
+      reportError(isPinnedView() ? "Failed to load pins" : "Failed to load directory", e);
+      modal.setStatus(`Error: ${(e as Error).message}`);
+      state.dirs = [];
+      state.files = [];
+      // A failed load says nothing about the scan; polling on top of an error
+      // would retry the failing request on a timer.
+      renderScanPill(0);
+    } finally {
+      stopLoadTicker();
+    }
+    if(generation!==loadGeneration || !modal.dialog.isConnected) return;
+    modal.setBusy(false);
+    // Pins render into the toolbar, which lives INSIDE the scroller — do it
+    // before the grid so the restore below measures the final content height.
+    renderPins();
+    // Navigating restores the folder's remembered scroll position (0 for a
+    // never-visited one) — each directory keeps its own place while you
+    // traverse up and down. Refresh-in-place (refresh button, paste/move
+    // re-list) keeps the position renderGrid restored.
+    //
+    // The destination's offset is handed INTO renderGrid rather than assigned
+    // after it. renderGrid would otherwise restore the offset it captured
+    // before `innerHTML = ""` — which belongs to the folder we just LEFT — and
+    // that write gets clamped into the new listing's range (measured
+    // 31185 → 1865 going up out of a deep folder). It survives today only
+    // because the corrected write lands 0.2 ms later in the same task; that is
+    // a dead write to delete, not a coincidence to rely on.
+    renderPager();
+    renderGrid({
+      scrollTo: restoring && resume ? resume.scrollTop : opts?.preserveScroll ? undefined : scrollMemory.get(locationKey()),
+    });
+    restoring = false;
+    updateSelectedCount();
+    viewStore.markPending(false);
+  }
+
+  // Client-side media narrowing for the pinned view only — see the comment at
+  // its call site in loadAndRender for why filtering the response is correct
+  // there and wrong for /list.
+  function narrowByKind(files: ListingFile[], filter: TypeFilter): ListingFile[] {
+    if (filter === "all") return files;
+    const want = filter === "images" ? IMG_EXTS : VIDEO_EXTS;
+    return files.filter((f) => want.has((f.ext || "").toLowerCase()));
+  }
+
+  function thumbForFile(f: ListingFile): ThumbDescriptor {
+    // A pin whose file is gone has nothing to fetch — a thumbnail request for it
+    // would 404 per card. Say so instead.
+    if (f.pinExists === false) return { kind: "icon", text: "⚠" };
+    const ext = (f.ext || "").toLowerCase();
+    const sub = fileSub(f);
+    const type = fileType(f);
+    if (IMG_EXTS.has(ext)) {
+      return {
+        kind: "img",
+        src: imageThumbURL(type, sub, f.name, state.absPath, thumbVersion(f.mtime, f.size)),
+      };
+    }
+    if (VIDEO_EXTS.has(ext)) {
+      // A type=path video plays through /image_browser/file, which is OFF
+      // unless the user opted in. Mounting a <video> whose source 403s renders
+      // a permanently blank tile with nothing to click and no explanation, so
+      // say so on the card instead. Sandboxed roots are unaffected: they play
+      // through core /api/view, which the opt-in does not touch.
+      if (type === "path" && !pathReadsAllowed()) {
+        return { kind: "icon", text: "🔒", title: PATH_READS_DISABLED_MSG };
+      }
+      return {
+        kind: "video",
+        src: videoSrcURL(type, sub, f.name, state.absPath),
+      };
+    }
+    return { kind: "icon", text: "📄" };
+  }
+
+  /**
+   * Paint the density pill's active segment.
+   *
+   * Called from renderGrid rather than renderTabs, and that is the whole point:
+   * renderTabs runs only on a LOAD, while a density change deliberately does
+   * not refetch — so a sync living there would leave the pill showing the
+   * previous step until the next navigation.
+   *
+   * aria-pressed alongside the class: this is a mode control, so the state has
+   * to reach an assistive reader and not only the stylesheet.
+   */
+  function syncDensitySegs(): void {
+    for (const b of densityGroupEl.querySelectorAll(".ib-density-seg")) {
+      const on = (b as HTMLElement).dataset.density === state.density;
+      b.classList.toggle("is-active", on);
+      b.setAttribute("aria-pressed", String(on));
+    }
+  }
+
+  function renderGrid(opts?: { scrollTo?: number }): void {
+    // FIRST, before anything reads or writes the grid. The previous render may
+    // still have a tail scheduled, and a chunk of the OLD listing appending
+    // into the new grid is the failure mode chunking introduces — see
+    // cancelChunkJob. Disposing the observers here rather than at the end is
+    // the same rule: the cards they watch are about to stop existing.
+    cancelChunkJob();
+    disposeLazyThumbs();
+    const q = state.query;
+    syncDensitySegs();
+    /**
+     * One card label as head + tail spans.
+     *
+     * The HEAD is what the browser ellipsizes; the TAIL never elides. See
+     * src/label.ts for why the split is done in the DOM rather than by
+     * computing a character budget from the grid's minmax(), and for why the
+     * extension is kept while the save counter is not.
+     *
+     * No `color` is set on either span, deliberately: Safe View's spoiler puts
+     * `color: transparent` on `.ib-name` and the spans must INHERIT it, or a
+     * hidden name would render in the clear inside its own block.
+     */
+    const nameSpans = (name: string): string => {
+      const { head, tail } = labelParts(name, !!q);
+      const tailSpan = `<span class="ib-name-tail">${escHTML(tail)}</span>`;
+      return head ? `<span class="ib-name-head">${escHTML(head)}</span>${tailSpan}` : tailSpan;
+    };
+
+    // Re-renders happen after delete/move/rename/sort — wiping innerHTML
+    // resets the body's scrollTop, so capture and restore it. Keyboard focus
+    // moves scroll separately via applyFocus. `scrollTo` overrides the capture
+    // for callers that already know where the view belongs (a navigation's
+    // remembered offset, or 0 for a new search/sort) — see loadAndRender.
+    const targetScrollTop = opts?.scrollTo ?? scroller.current();
+    // ONE read for the whole pass — never one per card (the kit's contract).
+    const safeCfg = readSafeViewConfig();
+    // The keyword 🙈 writes, resolved ONCE per pass for the same reason. `null`
+    // when the user has configured no keywords at all — the control is then not
+    // rendered, because there is nothing it could write that the filter would
+    // honour. `sensitiveKeyword` is the KIT's now (it was two hand-written
+    // copies over the same files on disk, so a divergence would have marked a
+    // file here that comfyui-gallery-loader's filter then ignored — that is
+    // laurigates/comfy-modal-kit#33, closed by the extraction).
+    const safeKeyword = sensitiveKeyword(safeCfg);
+    renderSafeToggle(safeCfg);
+    gridEl.innerHTML = "";
+    // The step the CSS keys off. Set on every pass rather than only on change,
+    // so a grid rebuilt for any reason cannot come back at the wrong density.
+    gridEl.dataset.density = state.density;
+    // LOCATION-level write flag — it governs the ".." / folder cards, which
+    // belong to the directory being shown. Per-CARD controls must NOT use it:
+    // in the pinned view state.type is "pinned" (not a sandboxed root) while
+    // every card's own root is, so using this for the card buttons would ship a
+    // pinned grid with no rename/move/delete/stars/✓ at all. Cards use
+    // canWriteFile(f).
+    const canWrite = SANDBOXED_TYPES.includes(state.type);
+    // Flat view collapses the subtree into files only — no ".." card and no
+    // folder cards (the backend returns dirs:[] recursively anyway).
+    const flat = isFlat();
+    const pinnedView = isPinnedView();
+
+    const showUp = !flat && canGoUp();
+    if (showUp) {
+      const up = document.createElement("div");
+      up.className = "ib-card is-up";
+      up.innerHTML = `<div class="ib-thumb ib-thumb-icon">↑</div><div class="ib-name">..</div>`;
+      gridEl.appendChild(up);
+    }
+
+    if (!flat) {
+      for (const d of state.dirs) {
+        if (q && !d.name.toLowerCase().includes(q)) continue;
+        const c = document.createElement("div");
+        c.className = "ib-card is-dir";
+        c.dataset.name = d.name;
+        // Folder move/delete ride the same write gate as the file mutations. Move
+        // opens the destination picker (excluding the folder's own subtree); an
+        // empty folder deletes outright, a non-empty one confirms with the nested
+        // file count (see onMoveDir / onDeleteDir).
+        const dirBtns = canWrite
+          ? `<button type="button" class="ib-dir-move" data-action="movedir" title="Move folder">⇄</button>` +
+            `<button type="button" class="ib-dir-del" data-action="rmdir" title="Delete folder">🗑</button>`
+          : "";
+        c.innerHTML = `<div class="ib-thumb ib-thumb-icon">📁</div><div class="ib-name" title="${escHTML(d.name)}">${nameSpans(d.name)}</div>${dirBtns}`;
+        gridEl.appendChild(c);
+        // A FOLDER IS MATCHED BY NAME ONLY — it carries no metadata to read.
+        // It gets no reveal button: tapping the card still descends into it,
+        // which is the reveal, and the files inside are judged on their own
+        // (now-matching) path. The consequence, documented in the README, is
+        // that a blandly-named folder full of sensitive files is caught in flat
+        // view — which lists the files — and not in folder view.
+        if (isSensitive({ name: d.name }, safeCfg)) {
+          c.classList.add("is-safe-hidden");
+          const icon = c.querySelector(".ib-thumb") as HTMLElement | null;
+          if (icon) setBlurred(icon, true);
+          if (safeCfg.blurNames) {
+            const nameEl = c.querySelector(".ib-name") as HTMLElement | null;
+            if (nameEl) setSpoilered(nameEl, true);
+          }
+        }
+      }
+    }
+
+    let files = state.files;
+    if (q && !options.listing) {
+      const scored: { f: ListingFile; score: number }[] = [];
+      for (const f of files) {
+        // In flat view the query matches "subpath/name" so you can filter by
+        // folder too; folder view matches the bare filename as before.
+        const hay = flat && f.subpath ? `${f.subpath}/${f.name}` : f.name;
+        const r = fuzzyScore(q, hay);
+        if (r) scored.push({ f, score: r.score });
+      }
+      scored.sort((a, b) => b.score - a.score);
+      files = scored.map((x) => x.f);
+    } else if (!options.listing) {
+      files = sortFiles(files, state.sortKey, state.sortDir);
+    }
+    renderedFiles = files;
+    if (files.length === 0) focusIndex = -1;
+    else if (focusIndex < 0) focusIndex = 0;
+    else if (focusIndex >= files.length) focusIndex = files.length - 1;
+
+    // The per-pass values every card is built against. Bundled and passed
+    // explicitly rather than closed over, because a chunked render's tail
+    // OUTLIVES this call: a chunk landing three frames later must build
+    // against the listing and the Safe View config of ITS pass.
+    //
+    // `focusIndex` and the selection are deliberately NOT in here. Those do
+    // genuinely move while the tail lands, so a late card reads them live off
+    // the closure and comes up already focused or already ticked.
+    const ctx: CardContext = { flat, pinnedView, safeCfg, safeKeyword, nameSpans };
+
+    // Counted from the LISTING, not from the cards appended: most cards do not
+    // exist yet when the count is painted. Identical to the old per-append
+    // tally, which only ever skipped a hole in a dense array.
+    let visible = 0;
+    for (const f of files) if (f) visible++;
+
+    // The first screenful, synchronously — everything past it is deferred.
+    const syncCount = Math.min(files.length, SYNC_CARD_BUDGET);
+    appendCards(files, 0, syncCount, ctx, 0);
+
+    if (!visible && !state.dirs.length && !showUp) {
+      const el = document.createElement("div");
+      el.className = "ib-empty";
+      el.textContent = pinnedView
+        ? "No pinned files. Tap 📌 on a card to add one."
+        : "No matching files in this folder.";
+      gridEl.appendChild(el);
+    }
+
+    setCount(visible, state.files.length);
+    // Restore BEFORE installing the observer, so its first pass is computed
+    // against the final viewport. The old order (observe, then scroll) was
+    // latent rather than broken — IntersectionObserver delivers its callbacks
+    // asynchronously, after the task holding the write — but restoreScroll now
+    // also corrects across later frames, and an observer registered against the
+    // pre-restore viewport would have queued the top-of-list band for fetching
+    // before that. In flat view that is thousands of wrong /thumb requests.
+    scroller.restore(targetScrollTop);
+    observeThumbChunk(0);
+
+    // The tail, one chunk per frame. Cancelled by the next renderGrid and by
+    // onClose — see cancelChunkJob for why that takes two guards, not one.
+    if (syncCount < files.length) {
+      const job: ChunkJob = {
+        files,
+        ctx,
+        next: syncCount,
+        seq: 1,
+        scrollTarget: targetScrollTop,
+        lastAsserted: scroller.current(),
+        raf: null,
+      };
+      chunkJob = job;
+      if (typeof requestAnimationFrame === "function") {
+        scheduleChunk(job);
+      } else {
+        // No rAF (a non-visual jsdom, an embedder without one): build the rest
+        // NOW rather than never. That is the pre-chunking behaviour — slow,
+        // but a whole grid. A listing silently missing its tail would be worse.
+        while (job.next < files.length) buildChunk(job);
+        chunkJob = null;
+      }
+    }
+  }
+
+  /**
+   * Build ONE file card. Extracted from renderGrid's loop so the chunked
+   * tail can call it a frame at a time — see ChunkJob.
+   *
+   * `fi` is the index into the WHOLE listing, not into the chunk: it becomes
+   * `data-idx`, which every click handler reads back as `renderedFiles[idx]`.
+   */
+  function buildFileCard(f: ListingFile, fi: number, ctx: CardContext): HTMLElement {
+    const { flat, pinnedView, safeCfg, safeKeyword, nameSpans } = ctx;
+    const c = document.createElement("div");
+    c.className = "ib-card is-file";
+    // Per-card write gate — the card's OWN root, not the location's.
+    const canWriteThis = canWriteFile(f);
+    // Safe View's verdict for this card, decided BEFORE the markup is built:
+    // the checkbox's accessible name carries the filename, and an
+    // accessible name is not something a CSS spoiler can block. Computing it
+    // here is what lets that one string be swapped rather than patched.
+    const hidden = isCardHidden(f, safeCfg);
+    // Names are only blocked when the user asked for it; the thumbnail blur
+    // is not optional, since the image is the thing being hidden.
+    const spoilNames = hidden && safeCfg.blurNames;
+    // A pin whose target is gone. Dimmed and stripped back to its unpin
+    // affordance: every other control would address a file that isn't there.
+    const missing = f.pinExists === false;
+    // Flat cards carry a subpath row above the thumb — the marker lets CSS
+    // drop the selection checkbox below it so the two don't overlap. Pinned
+    // cards carry the same row (their full address), so they share the class.
+    if (flat || pinnedView) c.classList.add("is-flat");
+    if (missing) c.classList.add("is-missing");
+    if (fi === focusIndex) c.classList.add("is-focused");
+    if (isSelected(f)) c.classList.add("is-selected");
+    c.dataset.name = f.name;
+    c.dataset.ext = (f.ext || "").toLowerCase();
+    c.dataset.idx = String(fi);
+    const t = thumbForFile(f);
+    const dims = f.width && f.height ? `${f.width}×${f.height}` : "";
+    const when = new Date(f.mtime * 1000).toLocaleString();
+    const titleText = dims ? `${f.name}\n${dims}\n${when}` : `${f.name}\n${when}`;
+    const thumbInner =
+      t.kind === "img"
+        ? `<img loading="lazy" decoding="async" data-src="${t.src}" alt="">`
+        : t.kind === "video"
+          ? `<video muted playsinline preload="none" data-src="${t.src}"></video>`
+          : `<div class="ib-thumb-icon"${
+              t.title ? ` title="${escHTML(t.title)}"` : ""
+            }>${t.text}</div>`;
+    // The ⓘ metadata button is the ONE card control deliberately outside the
+    // canWrite mirror: /metadata is a READ and accepts type=path, so it belongs
+    // on the browse…/path tab too. Don't "fix" this into canWrite. It is gated
+    // on META_EXTS instead — same ext source thumbForFile uses — which mirrors
+    // the endpoint's own gate: every image, plus the video containers the
+    // backend can parse. A .avi has no reader and would 400, so it gets no ⓘ.
+    const hasMeta = META_EXTS.has((f.ext || "").toLowerCase());
+    const metaBtn = hasMeta
+      ? `<button type="button" class="ib-act" data-action="meta" title="Metadata (i)">ⓘ</button>`
+      : "";
+    // Load-workflow rides the same gate as ⓘ (both are READS through /metadata,
+    // which accepts type=path), so it appears on the browse…/path tab too and
+    // stays outside the canWrite mirror. It is offered for every readable file
+    // rather than only for those known to carry a graph: knowing that requires
+    // the per-file metadata read, and doing that for every card in a listing
+    // would cost one request per thumbnail. The click path reads it and says so.
+    const wfBtn = hasMeta
+      ? `<button type="button" class="ib-act" data-action="workflow" title="Load workflow (w)">⤓</button>`
+      : "";
+    // Move is only offered for the sandboxed roots (backend rejects path writes).
+    const moveBtn = canWriteThis
+      ? `<button type="button" class="ib-act" data-action="move" title="Move">⇄</button>`
+      : "";
+    const renameBtn = canWriteThis
+      ? `<button type="button" class="ib-act" data-action="rename" title="Rename">✎</button>`
+      : "";
+    const deleteBtn = canWriteThis
+      ? `<button type="button" class="ib-act ib-act-danger" data-action="delete" title="Delete">🗑</button>`
+      : "";
+    // Pin/unpin this file. Same perimeter as the writes — a pin addresses a
+    // sandboxed root only — so the browse…/path tab gets none, and the state
+    // is read SYNCHRONOUSLY off the module cache (a GET per card is not an
+    // option). Filled while pinned.
+    const isFilePinned = canWriteThis && isPinned(filePinItem(f));
+    const pinBtn = canWriteThis
+      ? `<button type="button" class="ib-act ib-act-pin${isFilePinned ? " is-pinned" : ""}" data-action="pin" title="${isFilePinned ? "Unpin this file" : "Pin this file"}">📌</button>`
+      : "";
+    // 🙈 writes the user's first Safe View keyword into the file's dc:subject.
+    // A WRITE, so it rides the per-card canWrite mirror exactly like ✎/⇄/🗑
+    // and never appears on the browse…/path tab — /image_browser/tag rejects
+    // type=path, and a control that 400s is worse than no control. Offered
+    // only when there IS a keyword to write, and never on a missing pin
+    // (the write would address a file that is not there).
+    const markBtn =
+      canWriteThis && !missing && safeKeyword
+        ? markSensitiveHTML("ib", safeKeyword, hasSensitiveTag(f, safeKeyword))
+        : "";
+    // Rating writes are sandboxed like the other mutations, so path mode
+    // gets a read-only star display (when rated) instead of dead buttons.
+    const starsRow = canWriteThis
+      ? starsHTML("ib", ratingOf(f))
+      : ratingOf(f)
+        ? `<div class="ib-stars is-ro" data-rating="${ratingOf(f)}">${"★".repeat(ratingOf(f))}</div>`
+        : "";
+    // The selection checkbox is the touch affordance for multi-select: it
+    // has touch-action:none, so a drag starting on it sweeps a range
+    // instead of scrolling. Only where writes are allowed.
+    // The accessible name is the THIRD channel the filename escapes through,
+    // after the visible text and the `title` tooltip — and the only one CSS
+    // cannot touch. A spoiler that paints a block while a screen reader (or
+    // anything else surfacing accessible names) still announces
+    // "Select holiday_nsfw_01.png" has hidden nothing.
+    const checkBtn = canWriteThis
+      ? `<button type="button" class="ib-check" data-check aria-label="${
+          spoilNames ? "Select hidden item" : `Select ${escHTML(f.name)}`
+        }">✓</button>`
+      : "";
+    // Flat view: show the file's folder above the thumbnail. It's a button —
+    // tapping it drops back to folder view at that directory. Top-level files
+    // (subpath "") get a muted "/" so the row height stays consistent.
+    //
+    // The pinned view reuses the same row for the FULL address (root
+    // included), because pins span roots and a bare subfolder would not say
+    // which one — so its label also carries data-pin-type, and tapping it
+    // switches root as well as folder.
+    const subLabel = pinnedView
+      ? `<button type="button" class="ib-subpath" data-pin-type="${escHTML(fileType(f))}" data-sub="${escHTML(fileSub(f))}" title="Go to ${escHTML(pinLabel(filePinItem(f)))}">${nameSpans(`${fileType(f)}/${fileSub(f) ? `${fileSub(f)}/` : ""}`)}</button>`
+      : flat
+        ? f.subpath
+          ? `<button type="button" class="ib-subpath" data-sub="${escHTML(fileSub(f))}" title="Go to ${escHTML(f.subpath)}">${nameSpans(f.subpath)}</button>`
+          : `<div class="ib-subpath is-root" title="Top level">/</div>`
+        : "";
+    c.innerHTML = missing
+      ? `
+      ${subLabel}
+      <div class="ib-thumb">${thumbInner}</div>
+      <div class="ib-name" title="${escHTML(f.name)}">${nameSpans(f.name)}</div>
+      <div class="ib-meta">missing</div>
+      <div class="ib-actions">${pinBtn}</div>`
+      : `
+      ${subLabel}
+      ${checkBtn}
+      <div class="ib-thumb">${thumbInner}</div>
+      <div class="ib-name" title="${escHTML(titleText)}">${nameSpans(f.name)}</div>
+      ${dims ? `<div class="ib-meta">${dims}</div>` : ""}
+      ${starsRow}
+      <div class="ib-actions">${actionRowHTML([
+        // PRIORITY ORDER — see actionRowHTML. The two STATEFUL controls come
+        // first, because their state is the reason they are on the card at
+        // all: 📌 renders filled while pinned and 🙈 pressed while marked,
+        // and a control whose state you cannot see without opening a sheet
+        // has stopped being an indicator. ↗ open-in-tab follows them rather
+        // than leading, because a tap anywhere on the card already opens the
+        // full-size lightbox (the grid click handler's fall-through) — so it
+        // is the one control whose demotion costs the user nothing.
+        // Destructive last, which is the whole point of #90.
+        pinBtn,
+        markBtn,
+        `<button type="button" class="ib-act" data-action="open" title="Open in new tab">↗</button>`,
+        metaBtn,
+        wfBtn,
+        renameBtn,
+        moveBtn,
+        deleteBtn,
+      ])}</div>`;
+    if(options.compact){
+      c.querySelector('.ib-stars')?.remove();
+      const actions=c.querySelector('.ib-actions');
+      if(actions)actions.innerHTML='<button type="button" class="ib-act" data-action="preview" title="画像を拡大">拡大</button>'+wfBtn.replace('⤓','グラフ').replace('Load workflow (w)','グラフを開く (W)');
+    }
+    options.decorateCard?.(c,{...f,type:fileType(f),subfolder:fileSub(f)});
+    if (hidden) applySafeView(c, f, spoilNames);
+    return c;
+  }
+
+  /**
+   * The per-pass values a card is built against — see the `ctx` in renderGrid
+   * for why these travel with the job rather than being read off the closure.
+   */
+  interface CardContext {
+    flat: boolean;
+    pinnedView: boolean;
+    safeCfg: ReturnType<typeof readSafeViewConfig>;
+    safeKeyword: ReturnType<typeof sensitiveKeyword>;
+    nameSpans: (name: string) => string;
+  }
+
+  /** The deferred tail of one render. At most one exists at a time. */
+  interface ChunkJob {
+    files: ListingFile[];
+    ctx: CardContext;
+    /** Index of the next file to build. Everything below it is in the DOM. */
+    next: number;
+    /** Which chunk lands next — the `data-chunk` its observer is scoped to. */
+    seq: number;
+    /** The offset this render was asked to land on, re-armed as chunks land. */
+    scrollTarget: number;
+    /** What we last put on the scroller, so a USER scroll is distinguishable. */
+    lastAsserted: number;
+    raf: number | null;
+  }
+
+  let chunkJob: ChunkJob | null = null;
+
+  /**
+   * Drop the in-flight tail, if any.
+   *
+   * Called FIRST in renderGrid — before the grid is emptied — and from onClose.
+   * A stale chunk appending into a grid that has since been rebuilt is the one
+   * bug chunking introduces, and stopping it takes TWO guards, both live:
+   *
+   *  1. this `cancelAnimationFrame`, so a frame that has not run yet never runs;
+   *  2. the `chunkJob !== job` check inside the frame callback, for a callback
+   *     the engine has ALREADY dispatched into the batch it is running — which
+   *     is what a re-render triggered from inside another rAF callback, or from
+   *     a click handled in the same frame, produces.
+   *
+   * Guard 1 alone leaves that race open. Guard 2 alone leaves the main thread
+   * woken every frame for a job that will do nothing. Neither substitutes for
+   * the other, so neither may be removed as redundant.
+   */
+  function cancelChunkJob(): void {
+    const job = chunkJob;
+    chunkJob = null;
+    if (job && job.raf !== null && typeof cancelAnimationFrame === "function") {
+      cancelAnimationFrame(job.raf);
+    }
+  }
+
+  /** Append `files[from..to)` as cards tagged `data-chunk="<seq>"`. */
+  function appendCards(
+    files: ListingFile[],
+    from: number,
+    to: number,
+    ctx: CardContext,
+    seq: number,
+  ): void {
+    for (let fi = from; fi < to; fi++) {
+      const f = files[fi];
+      if (!f) continue;
+      const c = buildFileCard(f, fi, ctx);
+      // The observer's handle on this chunk. Set BEFORE the append so the card
+      // is already addressable when observeThumbChunk queries for it.
+      c.dataset.chunk = String(seq);
+      gridEl.appendChild(c);
+    }
+  }
+
+  /** Build ONE chunk into the DOM and observe it. Schedules nothing. */
+  function buildChunk(job: ChunkJob): void {
+    const to = Math.min(job.files.length, job.next + CHUNK_CARDS);
+    appendCards(job.files, job.next, to, job.ctx, job.seq);
+    observeThumbChunk(job.seq);
+    job.next = to;
+    job.seq++;
+    reassertChunkScroll(job);
+  }
+
+  function scheduleChunk(job: ChunkJob): void {
+    job.raf = requestAnimationFrame(() => {
+      job.raf = null;
+      // GUARD 2 — see cancelChunkJob. Not redundant with the cancel there.
+      if (chunkJob !== job) return;
+      runChunk(job);
+    });
+  }
+
+  function runChunk(job: ChunkJob): void {
+    buildChunk(job);
+    if (job.next < job.files.length) scheduleChunk(job);
+    else chunkJob = null;
+  }
+
+  /**
+   * Re-assert this render's scroll target as the tail lands.
+   *
+   * A restore issued against the first screenful clamps to whatever that SHORT
+   * grid can reach, and the kit's restorer defends its target for a bounded 12
+   * frames — fewer than a 5000-card tail takes. So every chunk re-arms it, and
+   * every chunk also asks whether it still should:
+   *
+   *  - a target at or below 0 was finished by the first synchronous assignment
+   *    (the restorer's own contract), and re-arming it would drag a new search
+   *    or sort off the top it is supposed to stay at;
+   *  - an offset that no longer matches what we last asserted is the USER's,
+   *    and their scroll wins for the remainder of this render.
+   */
+  function reassertChunkScroll(job: ChunkJob): void {
+    if (job.scrollTarget <= 0) return;
+    const now = scroller.current();
+    if (now !== job.lastAsserted) return;
+    if (now >= job.scrollTarget) return;
+    scroller.restore(job.scrollTarget);
+    job.lastAsserted = scroller.current();
+  }
+
+  /**
+   * Bring the tail forward far enough that card `index` exists.
+   *
+   * Keyboard focus addresses `renderedFiles[i]`, which is the whole listing
+   * from the first frame — so `G` (last file) while a tail is in flight sets a
+   * focusIndex that no card carries, and the ring lands nowhere. Clamping the
+   * keyboard to what has been painted was the alternative, and it would make
+   * `G` mean different things at different moments. Instead the jump pays the
+   * construction cost it asked for, synchronously, and only in a session that
+   * actually asks for it.
+   */
+  function ensureCardsBuilt(index: number): void {
+    const job = chunkJob;
+    if (!job || index < job.next) return;
+    if (job.raf !== null && typeof cancelAnimationFrame === "function") {
+      cancelAnimationFrame(job.raf);
+    }
+    job.raf = null;
+    while (job.next <= index && job.next < job.files.length) buildChunk(job);
+    if (job.next < job.files.length) scheduleChunk(job);
+    else chunkJob = null;
+  }
+
+  /**
+   * Blur, spoiler and add the reveal control to one already-appended card.
+   *
+   * Applied to the LIVE NODE rather than woven into the markup string, because
+   * the blur and the spoiler arrive through the kit's injected class rules —
+   * the same rules `comfyui-gallery-loader` uses — and `setSpoilered` also
+   * strips the `title` attribute, which no amount of CSS can hide. That
+   * stripping is the point: a native tooltip renders the filename in full on
+   * hover regardless of the block painted over the text.
+   *
+   * The reveal button is appended to the CARD, not to the thumbnail: the blur
+   * is on the thumbnail, so a button inside it would be blurred too.
+   */
+  function applySafeView(card: HTMLElement, f: ListingFile, spoilNames: boolean): void {
+    card.classList.add("is-safe-hidden");
+    const thumb = card.querySelector(".ib-thumb") as HTMLElement | null;
+    if (thumb) setBlurred(thumb, true);
+    if (spoilNames) {
+      // Both label channels: the filename, and the subpath/pinned-address row —
+      // which in the pinned and flat views is usually the thing that MATCHED,
+      // so leaving it readable would announce exactly what was hidden.
+      for (const sel of [".ib-name", ".ib-subpath"]) {
+        const el = card.querySelector(sel) as HTMLElement | null;
+        if (el) setSpoilered(el, true);
+      }
+    }
+    card.appendChild(
+      makeRevealButton({
+        onReveal: () => {
+          revealed.reveal(fileType(f), fileSub(f), f.name);
+          // No scrollTo: renderGrid captures the live offset, so revealing a
+          // card deep in a listing repaints in place.
+          renderGrid();
+        },
+      }),
+    );
+  }
+
+  // The root MUST be the scrolling ancestor (`.cmp-body` / scrollHost), NEVER
+  // `.ib-grid`: the grid has no overflow clip, so rooting on it makes the root
+  // rectangle its whole bounding box and every card in the listing reports as
+  // intersecting on the first callback — thousands of simultaneous /thumb
+  // requests in flat view. The kit takes the root as a required parameter for
+  // exactly this reason. Disposed on every re-render and in onClose; nothing
+  // scheduled may outlive the modal.
+  //
+  // A LIST, not the single handle this used to be: a chunked render installs
+  // one observer per chunk, so dropping any one of them leaks an observer still
+  // holding every card it was watching.
+  let lazyThumbDisposers: (() => void)[] = [];
+
+  function disposeLazyThumbs(): void {
+    for (const dispose of lazyThumbDisposers) dispose();
+    lazyThumbDisposers = [];
+  }
+
+  /**
+   * Observe chunk `seq`'s thumbnails, and only that chunk's.
+   *
+   * Scoping by `data-chunk` rather than re-observing the whole grid is what
+   * keeps the tail linear: re-installing over the grid on every chunk would
+   * re-walk every card appended so far, so a 5000-card listing at 240 a frame
+   * would query ~52,000 elements to observe 5000. The already-promoted cards
+   * would be skipped (the kit strips `data-src` when it loads one), but the
+   * ones still pending from earlier chunks would end up observed by two live
+   * observers at once, each holding a reference to them.
+   *
+   * The root MUST stay scrollHost — see the hard rule in CLAUDE.md. Only the
+   * lookahead varies with density.
+   */
+  function observeThumbChunk(seq: number): void {
+    lazyThumbDisposers.push(
+      installLazyMedia(gridEl, {
+        root: scrollHost,
+        rootMargin: DENSITY_ROOT_MARGIN[state.density],
+        selector: `[data-chunk="${seq}"] img[data-src], [data-chunk="${seq}"] video[data-src]`,
+      }),
+    );
+  }
+
+  function reportError(summary: string, e: unknown): void {
+    const detail = e instanceof Error ? e.message : String(e);
+    console.warn(`[${EXT_NAME}] ${summary}:`, e);
+    notify({ severity: "error", summary, detail });
+  }
+
+  // ---- Vim-style keyboard navigation -----------------------------
+  function isInInput(): boolean {
+    const el = document.activeElement;
+    if (!el) return false;
+    const tag = el.tagName;
+    return (
+      tag === "INPUT" ||
+      tag === "TEXTAREA" ||
+      tag === "SELECT" ||
+      (el as HTMLElement).isContentEditable
+    );
+  }
+
+  function selectionKey(type: BrowseType, subfolder: string, name: string): string {
+    return `${type}:${subfolder}:${name}`;
+  }
+
+  function isSelected(f: ListingFile): boolean {
+    // Keyed on the CARD's root, so a pinned card and the same file seen in its
+    // own folder are one selection, not two.
+    if (!canWriteFile(f)) return false;
+    return selected.has(selectionKey(fileType(f), fileSub(f), f.name));
+  }
+
+  function fileCards(): HTMLElement[] {
+    return Array.from(gridEl.querySelectorAll<HTMLElement>(".ib-card.is-file"));
+  }
+
+  function gridColumns(): number {
+    const cards = fileCards();
+    if (cards.length < 2) return 1;
+    // The WIDEST row, not the first one. A listing renders DIRECTORY cards
+    // before file cards, so the first row of file cards is a partial row
+    // whenever the folder has subfolders — measured in the e2e fixture, whose
+    // three directory cards leave exactly one file in the first file row of a
+    // two-column grid. Reading that row made gridColumns() return 1, so j/k
+    // stepped by one card and behaved identically to l/h. The last row is
+    // partial for the same reason, which is why this takes a maximum rather
+    // than a mode.
+    const byTop = new Map<number, number>();
+    let widest = 1;
+    for (const c of cards) {
+      const n = (byTop.get(c.offsetTop) ?? 0) + 1;
+      byTop.set(c.offsetTop, n);
+      if (n > widest) widest = n;
+    }
+    return widest;
+  }
+
+  function applyFocus(): void {
+    // The focus target may be past the end of a chunked render's painted tail
+    // (`G` on a 5000-file flat listing, one frame after it opened). Build up to
+    // it first, or the ring is toggled on a card that does not exist yet and
+    // lands nowhere. No-op once the tail is complete, which is the usual case.
+    ensureCardsBuilt(focusIndex);
+    for (const [i, c] of fileCards().entries()) {
+      c.classList.toggle("is-focused", i === focusIndex);
+    }
+    const focused = gridEl.querySelector(".ib-card.is-focused") as HTMLElement | null;
+    // Moving the keyboard focus IS a scroll intent — drop any restore still
+    // re-asserting from the render that preceded it, or the two fight.
+    scroller.cancel();
+    focused?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    // scrollIntoView is the one in-pack scroll mutator that bypasses the
+    // restorer's own set(), and the `scroll` event that would refresh its mirror
+    // is dispatched at the frame's rendering step — AFTER this task's input
+    // events. A close in the same frame (key autorepeat plus a tap on ✕, or any
+    // long frame while thumbnails decode) would then remember a stale mirror:
+    // measured 12279 on screen, 0 stored. The scroller is attached here by
+    // construction, so sync() reads the real position.
+    scroller.sync();
+  }
+
+  function refreshSelectionClasses(): void {
+    for (const [i, c] of fileCards().entries()) {
+      const f = renderedFiles[i];
+      c.classList.toggle("is-selected", !!f && isSelected(f));
+    }
+  }
+
+  function moveFocus(delta: number): void {
+    const n = renderedFiles.length;
+    if (n === 0) return;
+    focusIndex = Math.max(0, Math.min(n - 1, focusIndex + delta));
+    if (visualMode) extendSelectionTo(focusIndex);
+    applyFocus();
+  }
+
+  function focusFirst(): void {
+    const n = renderedFiles.length;
+    if (n === 0) return;
+    focusIndex = 0;
+    if (visualMode) extendSelectionTo(focusIndex);
+    applyFocus();
+  }
+
+  function focusLast(): void {
+    const n = renderedFiles.length;
+    if (n === 0) return;
+    focusIndex = n - 1;
+    if (visualMode) extendSelectionTo(focusIndex);
+    applyFocus();
+  }
+
+  function updateSelectedCount(): void {
+    const n = selected.size;
+    selectedBadge.style.display = n > 0 ? "inline" : "none";
+    selectedBadge.textContent = n > 0 ? `${n} selected` : "";
+    selBar.classList.toggle("is-visible", n > 0);
+    selBarCount.textContent = `${n} selected`;
+    modal.dialog.dispatchEvent(new CustomEvent("hub-selection",{detail:{count:n}}));
+  }
+
+  function setSelectMode(on: boolean): void {
+    if (on && !canSelectHere()) return;
+    selectMode = on;
+    selectToggleEl.classList.toggle("is-active", on);
+    modal.dialog.classList.toggle("is-selecting", on);
+  }
+
+  // The four selectors below take their guard AND their key from the CARD, not
+  // from the location: in the pinned view one grid holds cards from several
+  // roots, so a location-level `state.type` guard would refuse the whole view
+  // and a location-level key would file every card under "pinned:".
+  function selectFile(f: ListingFile): void {
+    const sub = fileSub(f);
+    selected.set(selectionKey(fileType(f), sub, f.name), {
+      file: f,
+      type: fileType(f),
+      subfolder: sub,
+    });
+  }
+
+  function toggleSelectionAt(i: number): void {
+    const f = renderedFiles[i];
+    if (!f || !canWriteFile(f)) return;
+    const key = selectionKey(fileType(f), fileSub(f), f.name);
+    if (selected.has(key)) selected.delete(key);
+    else selectFile(f);
+    refreshSelectionClasses();
+    updateSelectedCount();
+  }
+
+  function setSelectedRange(a: number, b: number, on: boolean): void {
+    const lo = Math.min(a, b);
+    const hi = Math.max(a, b);
+    for (let i = lo; i <= hi; i++) {
+      const f = renderedFiles[i];
+      if (!f || !canWriteFile(f)) continue;
+      if (on) selectFile(f);
+      else selected.delete(selectionKey(fileType(f), fileSub(f), f.name));
+    }
+    refreshSelectionClasses();
+    updateSelectedCount();
+  }
+
+  function extendSelectionTo(i: number): void {
+    const lo = Math.min(visualAnchor, i);
+    const hi = Math.max(visualAnchor, i);
+    for (let k = lo; k <= hi; k++) {
+      const f = renderedFiles[k];
+      if (!f || !canWriteFile(f)) continue;
+      selectFile(f);
+    }
+    refreshSelectionClasses();
+    updateSelectedCount();
+  }
+
+  function selectAllVisible(): void {
+    for (const f of renderedFiles) {
+      if (!canWriteFile(f)) continue;
+      selectFile(f);
+    }
+    refreshSelectionClasses();
+    updateSelectedCount();
+  }
+
+  function clearSelection(): void {
+    selected.clear();
+    refreshSelectionClasses();
+    updateSelectedCount();
+  }
+
+  function toggleVisualMode(): void {
+    if (!canSelectHere()) return;
+    if (renderedFiles.length === 0) return;
+    visualMode = !visualMode;
+    if (visualMode) {
+      if (focusIndex < 0) focusIndex = 0;
+      visualAnchor = focusIndex;
+      extendSelectionTo(focusIndex);
+    }
+    modal.dialog.classList.toggle("is-visual", visualMode);
+  }
+
+  function collectSelectedOrFocused(): BatchItem[] {
+    if (selected.size > 0) {
+      return Array.from(selected.values()).map((v) => ({
+        type: v.type,
+        subfolder: v.subfolder,
+        name: v.file.name,
+      }));
+    }
+    const f = renderedFiles[focusIndex];
+    if (!f || !canWriteFile(f)) return [];
+    return [{ type: fileType(f), subfolder: fileSub(f), name: f.name }];
+  }
+
+  function setPending(op: "d" | "y" | "g"): void {
+    clearPending();
+    pendingOp = op;
+    pendingTimer = setTimeout(clearPending, 1500);
+    const hint =
+      op === "d" ? "d… (d/y=delete, n=cancel)" : op === "y" ? "y… (y=yank)" : "g… (g=top)";
+    modal.setStatus(hint);
+  }
+
+  function clearPending(): void {
+    if (pendingTimer) {
+      clearTimeout(pendingTimer);
+      pendingTimer = null;
+    }
+    pendingOp = null;
+    modal.setStatus("");
+  }
+
+  async function doDelete(): Promise<void> {
+    // No tab gate: selected items carry their own sandboxed type/subfolder,
+    // so acting on a selection is valid even while viewing the path tab
+    // (collectSelectedOrFocused never yields a path-tab item).
+    const items = collectSelectedOrFocused();
+    if (items.length === 0) return;
+    const count = items.length;
+    const ok = await confirmInShell(modal, {
+      title: count === 1 ? "Delete file?" : `Delete ${count} files?`,
+      message:
+        count === 1
+          ? `Permanently delete "${items[0]?.name}"? This cannot be undone.`
+          : `Permanently delete ${count} selected files? This cannot be undone.`,
+      confirmLabel: "Delete",
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      const result = await deleteMany(items);
+      const errored = new Set((result.errors ?? []).map((e) => e.name));
+      // items span all folders AND (in the pinned view) all roots — selection
+      // persists across tabs, and flat/pinned views show many at once; state.files
+      // is only what's on screen. So scope the view removal by full selection key
+      // (type+subfolder+name), never by bare name, and read the on-screen card's
+      // key through fileType/fileSub so a pinned card matches its own root.
+      const succeeded = new Set(
+        items
+          .filter((it) => !errored.has(it.name))
+          .map((it) => selectionKey(it.type, it.subfolder, it.name)),
+      );
+      state.files = state.files.filter(
+        (f) => !succeeded.has(selectionKey(fileType(f), fileSub(f), f.name)),
+      );
+      for (const it of items) {
+        if (!errored.has(it.name)) selected.delete(selectionKey(it.type, it.subfolder, it.name));
+      }
+      // Deleted files' pins are dead addresses — drop them in this handler.
+      await followPins(
+        items
+          .filter((it) => !errored.has(it.name))
+          .map((it) => ({
+            from: { kind: "file" as const, type: it.type, subfolder: it.subfolder, name: it.name },
+            to: null,
+          })),
+      );
+      updateSelectedCount();
+      renderGrid();
+      if (result.errors && result.errors.length > 0) {
+        const names = result.errors.map((e) => e.name).join(", ");
+        reportError(`Deleted ${result.deleted}, ${result.errors.length} failed`, new Error(names));
+      } else {
+        notify({ severity: "success", summary: "Deleted", detail: `${result.deleted} file(s)` });
+      }
+    } catch (e) {
+      reportError("Delete failed", e);
+    }
+  }
+
+  async function doMoveSelected(): Promise<void> {
+    // Batch move: the selection if there is one, else the focused file.
+    const items = collectSelectedOrFocused();
+    if (items.length === 0) return;
+    const dest = await pickDestination(modal, {
+      type: state.type,
+      subfolder: state.subfolder,
+    });
+    if (!dest) return;
+    try {
+      const result = await moveMany(items, dest.type, dest.subfolder);
+      const errored = new Set((result.errors ?? []).map((er) => er.name));
+      for (const it of items) {
+        if (!errored.has(it.name)) selected.delete(selectionKey(it.type, it.subfolder, it.name));
+      }
+      updateSelectedCount();
+      if (result.moved > 0) saveDest(dest);
+      // Moved files keep their pins, at the new address.
+      await followPins(
+        items
+          .filter((it) => !errored.has(it.name))
+          .map((it) => ({
+            from: { kind: "file" as const, type: it.type, subfolder: it.subfolder, name: it.name },
+            to: {
+              kind: "file" as const,
+              type: dest.type,
+              subfolder: dest.subfolder,
+              name: it.name,
+            },
+          })),
+      );
+      if (
+        isFlat() ||
+        isPinnedView() ||
+        (dest.type === state.type && dest.subfolder === state.subfolder)
+      ) {
+        // Flat view spans the whole subtree (a moved file may still be in view),
+        // in folder view files may have arrived INTO the current folder, and the
+        // pinned view's cards are the pin list itself (whose addresses just
+        // changed) — either way the surgical removal below can't be trusted, so
+        // re-list.
+        await loadAndRender({ preserveScroll: true });
+      } else {
+        const succeeded = new Set(
+          items
+            .filter((it) => !errored.has(it.name))
+            .map((it) => selectionKey(it.type, it.subfolder, it.name)),
+        );
+        state.files = state.files.filter(
+          (f) => !succeeded.has(selectionKey(fileType(f), fileSub(f), f.name)),
+        );
+        renderGrid();
+      }
+      if (result.errors && result.errors.length > 0) {
+        const names = result.errors.map((er) => er.name).join(", ");
+        reportError(`Moved ${result.moved}, ${result.errors.length} failed`, new Error(names));
+      } else {
+        notify({
+          severity: "success",
+          summary: "Moved",
+          detail: `${result.moved} file(s) → ${dest.type}${dest.subfolder ? `/${dest.subfolder}` : ""}`,
+        });
+      }
+    } catch (e) {
+      reportError("Move failed", e);
+    }
+  }
+
+  async function onNewFolder(): Promise<void> {
+    if (!SANDBOXED_TYPES.includes(state.type)) return;
+    const existing = new Set(state.dirs.map((d) => d.name));
+    const name = await promptInShell(modal, {
+      title: "New folder",
+      label: `Create in ${state.type}${state.subfolder ? `/${state.subfolder}` : ""}`,
+      value: "",
+      confirmLabel: "Create",
+      validate: (v) => {
+        if (!v) return "Folder name required";
+        if (v.includes("/") || v.includes("\\")) return "No slashes allowed";
+        if (v === "." || v === "..") return "Invalid name";
+        if (existing.has(v)) return "A folder with that name already exists";
+        return null;
+      },
+    });
+    if (!name) return;
+    try {
+      await makeDir(state.type, state.subfolder, name);
+      // Re-list so the new folder appears sorted among the others (and lands at
+      // its correct alphabetical slot) without flinging the view to the top.
+      await loadAndRender({ preserveScroll: true });
+      notify({ severity: "success", summary: "Folder created", detail: `"${name}"` });
+    } catch (e) {
+      reportError("Create folder failed", e);
+    }
+  }
+
+  /**
+   * POST the picked files into the folder the picker was opened from.
+   *
+   * The destination is captured BEFORE the request: the user can change tab or
+   * folder while a phone uploads a video, and the files must land where they
+   * were aimed, not wherever the grid is by the time the response arrives. The
+   * grid is only re-listed if it is still showing that folder.
+   *
+   * Progress is an in-dialog overlay naming the count. It is indeterminate —
+   * `fetch` exposes no upload progress — and it says so by not drawing a bar.
+   */
+  async function onUpload(files: File[]): Promise<void> {
+    if (!SANDBOXED_TYPES.includes(state.type)) return;
+    const type = state.type;
+    const subfolder = state.subfolder;
+    const where = `${type}${subfolder ? `/${subfolder}` : ""}`;
+    const ov = openShellOverlay(modal);
+    ov.card.innerHTML = `
+      <div class="cmp-ov-title">Uploading ${files.length} file(s)…</div>
+      <div class="ib-upload-where">to ${escHTML(where)}</div>`;
+    let result: Awaited<ReturnType<typeof uploadFiles>>;
+    try {
+      result = await uploadFiles(type, subfolder, files);
+    } catch (e) {
+      ov.close();
+      reportError("Upload failed", e);
+      return;
+    }
+    ov.close();
+    if (result.uploaded.length > 0 && state.type === type && state.subfolder === subfolder) {
+      // New files sort in by mtime; keep the user's place rather than jumping
+      // to the top (the same refresh-in-place 📁+ uses).
+      await loadAndRender({ preserveScroll: true });
+    }
+    const failures = result.errors.map((er) => `${er.name}: ${er.error}`).join("\n");
+    if (result.ok && result.errors.length === 0) {
+      notify({
+        severity: "success",
+        summary: "Uploaded",
+        detail: `${result.uploaded.length} file(s) to ${where}`,
+      });
+    } else if (result.uploaded.length > 0) {
+      reportError(
+        `Uploaded ${result.uploaded.length}, ${result.errors.length} failed`,
+        new Error(failures),
+      );
+    } else {
+      reportError("Upload failed", new Error(failures || result.error || "nothing was uploaded"));
+    }
+  }
+
+  async function onMoveDir(name: string): Promise<void> {
+    if (!SANDBOXED_TYPES.includes(state.type)) return;
+    // The folder's own path, so the picker can hide it (and its subtree) — the
+    // backend also refuses a self-nested move, this just keeps the UI from
+    // offering an impossible destination.
+    const srcSub = state.subfolder ? `${state.subfolder}/${name}` : name;
+    const dest = await pickDestination(
+      modal,
+      { type: state.type, subfolder: state.subfolder },
+      { type: state.type, subfolder: srcSub },
+    );
+    if (!dest) return;
+    try {
+      const result = await moveDir(state.type, state.subfolder, name, dest.type, dest.subfolder);
+      saveDest(dest);
+      const conflicts = result.errors ?? [];
+      if (conflicts.length > 0) {
+        // Merged into an existing folder, but some files already existed there —
+        // they were left in the source, so the folder still exists. Re-list to
+        // show what actually moved (keep pins: the source path is still live).
+        await loadAndRender({ preserveScroll: true });
+        reportError(
+          `Folder merged, ${conflicts.length} item(s) left in place`,
+          new Error(conflicts.map((c) => c.name).join(", ")),
+        );
+        return;
+      }
+      state.dirs = state.dirs.filter((d) => d.name !== name);
+      // A pin at (or under) the moved folder now points at a dead path — the
+      // folder lives elsewhere. Drop it (same treatment as folder delete), and
+      // drop the FILE pins inside it for the same reason.
+      await followPins(pinsUnder(state.type, srcSub).map((from) => ({ from, to: null })));
+      renderPins();
+      renderGrid();
+      notify({
+        severity: "success",
+        summary: result.merged ? "Folder merged" : "Folder moved",
+        detail: `"${name}" → ${dest.type}${dest.subfolder ? `/${dest.subfolder}` : ""}`,
+      });
+    } catch (e) {
+      reportError("Move folder failed", e);
+    }
+  }
+
+  async function onDeleteDir(name: string): Promise<void> {
+    if (!SANDBOXED_TYPES.includes(state.type)) return;
+    try {
+      // First attempt is non-recursive: an empty folder deletes outright; a
+      // non-empty one answers with the nested counts for the confirm below.
+      const res = await removeDir(state.type, state.subfolder, name, false);
+      if (res.status === "not_empty") {
+        const parts = [`${res.files} file${res.files === 1 ? "" : "s"}`];
+        if (res.dirs > 0) parts.push(`${res.dirs} subfolder${res.dirs === 1 ? "" : "s"}`);
+        const ok = await confirmInShell(modal, {
+          title: "Delete folder and contents?",
+          message: `"${name}" contains ${parts.join(" and ")}. Permanently delete everything inside? This cannot be undone.`,
+          confirmLabel: `Delete ${res.files} file${res.files === 1 ? "" : "s"}`,
+          danger: true,
+        });
+        if (!ok) return;
+        await removeDir(state.type, state.subfolder, name, true);
+      }
+      state.dirs = state.dirs.filter((d) => d.name !== name);
+      // A pin pointing at (or under) the deleted folder is now a dead end —
+      // folder pins and the file pins inside it alike.
+      const gone = state.subfolder ? `${state.subfolder}/${name}` : name;
+      await followPins(pinsUnder(state.type, gone).map((from) => ({ from, to: null })));
+      renderPins();
+      renderGrid();
+      notify({
+        severity: "success",
+        summary: "Folder deleted",
+        detail: res.status === "not_empty" ? `"${name}" (${res.files} files)` : `"${name}" (empty)`,
+      });
+    } catch (e) {
+      reportError("Delete folder failed", e);
+    }
+  }
+
+  function doYank(): void {
+    // Location-level, not per-file: yank only records self-describing items
+    // (collectSelectedOrFocused already refuses a non-writable card), and the
+    // pinned view's cards are writable.
+    if (!canSelectHere()) return;
+    const items = collectSelectedOrFocused();
+    if (items.length === 0) return;
+    yanked = items;
+    notify({
+      severity: "info",
+      summary: "Yanked",
+      detail: `${items.length} file(s) — press p to move here`,
+    });
+  }
+
+  async function doPaste(): Promise<void> {
+    // Stays strictly sandboxed: unlike yank, paste's destination IS the current
+    // location, and the pinned view is not a directory to move files into.
+    if (!SANDBOXED_TYPES.includes(state.type)) return;
+    if (!yanked || yanked.length === 0) {
+      notify({ severity: "info", summary: "Nothing to paste", detail: "Yank files first with yy" });
+      return;
+    }
+    try {
+      const result = await moveMany(yanked, state.type, state.subfolder);
+      const landed = yanked.filter((it) => !result.errors?.some((e) => e.name === it.name));
+      for (const it of landed) selected.delete(selectionKey(it.type, it.subfolder, it.name));
+      // Same as the batch move: a pasted (moved) file keeps its pin, re-pointed.
+      await followPins(
+        landed.map((it) => ({
+          from: { kind: "file" as const, type: it.type, subfolder: it.subfolder, name: it.name },
+          to: {
+            kind: "file" as const,
+            type: state.type,
+            subfolder: state.subfolder,
+            name: it.name,
+          },
+        })),
+      );
+      yanked = null;
+      updateSelectedCount();
+      if (result.moved > 0) saveDest({ type: state.type, subfolder: state.subfolder });
+      await loadAndRender({ preserveScroll: true });
+      if (result.errors && result.errors.length > 0) {
+        const names = result.errors.map((e) => e.name).join(", ");
+        reportError(`Moved ${result.moved}, ${result.errors.length} failed`, new Error(names));
+      } else {
+        notify({ severity: "success", summary: "Moved", detail: `${result.moved} file(s)` });
+      }
+    } catch (e) {
+      reportError("Paste (move) failed", e);
+    }
+  }
+
+  async function siblingNav(dir: -1 | 1): Promise<void> {
+    // Navigate to the previous/next sibling directory (alphabetical).
+    rememberScroll();
+    let parentType: BrowseType;
+    let parentSub: string;
+    let parentPath: string;
+    let currentName: string;
+    if (state.type === "path") {
+      const p = (state.absPath || "/").replace(/\/+$/, "");
+      if (p === "" || p === "/") return; // at root
+      const i = p.lastIndexOf("/");
+      parentPath = i <= 0 ? "/" : p.slice(0, i);
+      parentType = "path";
+      parentSub = "";
+      currentName = p.slice(i + 1);
+    } else {
+      const p = state.subfolder.replace(/\/+$/, "");
+      if (!p) return; // at root of this sandbox
+      const i = p.lastIndexOf("/");
+      parentSub = i <= 0 ? "" : p.slice(0, i);
+      parentType = state.type;
+      parentPath = "";
+      currentName = p.slice(i + 1);
+    }
+    try {
+      // Reads `dirs` only, so it deliberately passes no `kind` — folder cards
+      // are never extension-filtered, and making sibling navigation depend on
+      // the media filter would strand you in a folder the filter emptied.
+      const data = await fetchListing({
+        type: parentType,
+        subfolder: parentSub,
+        path: parentPath,
+      });
+      const dirs = (data.dirs || []).map((d) => d.name).sort();
+      const idx = dirs.indexOf(currentName);
+      if (idx < 0) return;
+      const next = idx + dir;
+      if (next < 0 || next >= dirs.length) return; // at end
+      const target = dirs[next];
+      if (!target) return;
+      if (state.type === "path") {
+        state.absPath = parentPath === "/" ? `/${target}` : `${parentPath}/${target}`;
+      } else {
+        state.subfolder = parentSub ? `${parentSub}/${target}` : target;
+      }
+      focusIndex = 0;
+      await loadAndRender();
+    } catch (e) {
+      reportError("Sibling navigation failed", e);
+    }
+  }
+
+  function showHelp(): void {
+    const ov = openShellOverlay(modal);
+    ov.card.classList.add("ib-help-card");
+    ov.card.innerHTML = `
+      <div class="cmp-ov-title">Keyboard shortcuts</div>
+      <div class="ib-help-body">
+        <div class="ib-help-col">
+          <div class="ib-help-h">Navigate</div>
+          <dl>
+            <dt>j / k</dt><dd>down / up row</dd>
+            <dt>h / l</dt><dd>left / right</dd>
+            <dt>g g</dt><dd>first file</dd>
+            <dt>G</dt><dd>last file</dd>
+            <dt>K</dt><dd>parent dir</dd>
+            <dt>H / L</dt><dd>prev / next sibling</dd>
+          </dl>
+        </div>
+        <div class="ib-help-col">
+          <div class="ib-help-h">Select</div>
+          <dl>
+            <dt>Space</dt><dd>toggle focused</dd>
+            <dt>v</dt><dd>visual mode</dd>
+            <dt>Ctrl+A</dt><dd>select all visible</dd>
+            <dt>Esc</dt><dd>clear selection</dd>
+            <dt>long-press</dt><dd>select mode (touch)</dd>
+            <dt>drag ✓</dt><dd>range select (touch)</dd>
+          </dl>
+        </div>
+        <div class="ib-help-col">
+          <div class="ib-help-h">Act</div>
+          <dl>
+            <dt>d d</dt><dd>delete selected</dd>
+            <dt>d y</dt><dd>confirm delete</dd>
+            <dt>y y</dt><dd>yank (cut) selected</dd>
+            <dt>p</dt><dd>paste (move) here</dd>
+            <dt>r</dt><dd>rename focused</dd>
+            <dt>m</dt><dd>move selected…</dd>
+          </dl>
+        </div>
+        <div class="ib-help-col">
+          <div class="ib-help-h">Other</div>
+          <dl>
+            <dt>Enter / o</dt><dd>open in lightbox (←/→ step, Del delete, Esc close)</dd>
+            <dt>i</dt><dd>metadata</dd>
+            <dt>w</dt><dd>load workflow</dd>
+            <dt>b</dt><dd>safe view on/off</dd>
+            <dt>/</dt><dd>focus search</dd>
+            <dt>?</dt><dd>this help</dd>
+            <dt>Esc</dt><dd>close (priority)</dd>
+          </dl>
+        </div>
+      </div>
+      <div class="cmp-ov-actions">
+        <button type="button" class="cmp-ov-btn cmp-ov-primary" data-help-close>Close</button>
+      </div>`;
+    const closeBtn = ov.card.querySelector("[data-help-close]") as HTMLButtonElement | null;
+    closeBtn?.addEventListener("click", () => ov.close());
+  }
+
+  function onWindowKey(e: KeyboardEvent): void {
+    // Skip when any overlay is open (confirm / prompt / help / move-picker).
+    if (modal.dialog.querySelector(".cmp-ov-backdrop")) return;
+    const inInput = isInInput();
+
+    // ESC — priority: input → pending → visual → selection → let shell close.
+    if (e.key === "Escape") {
+      if (inInput) {
+        (document.activeElement as HTMLElement | null)?.blur();
+      } else if (pendingOp) {
+        clearPending();
+      } else if (visualMode) {
+        visualMode = false;
+        modal.dialog.classList.remove("is-visual");
+      } else if (selectMode || selected.size > 0) {
+        setSelectMode(false);
+        clearSelection();
+      } else {
+        return; // let the modal shell close the browser
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    if (inInput) return;
+
+    // Ctrl+A — select all visible.
+    if (e.ctrlKey && !e.metaKey && !e.altKey && (e.key === "a" || e.key === "A")) {
+      e.preventDefault();
+      e.stopPropagation();
+      selectAllVisible();
+      return;
+    }
+
+    // Only plain keys — no Ctrl/Cmd/Alt (Shift is OK).
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+    // Pending operator sequences (d / y / g).
+    if (pendingOp) {
+      const op = pendingOp;
+      clearPending();
+      if (op === "d" && (e.key === "d" || e.key === "y" || e.key === "Enter")) {
+        e.preventDefault();
+        e.stopPropagation();
+        void doDelete();
+        return;
+      }
+      if (op === "d" && (e.key === "n" || e.key === "Escape")) {
+        e.preventDefault();
+        e.stopPropagation();
+        return; // cancel
+      }
+      if (op === "y" && e.key === "y") {
+        e.preventDefault();
+        e.stopPropagation();
+        doYank();
+        return;
+      }
+      if (op === "g" && e.key === "g") {
+        e.preventDefault();
+        e.stopPropagation();
+        focusFirst();
+        return;
+      }
+      // Any other key cancels the pending op and falls through to the single-key switch.
+    }
+
+    const f = renderedFiles[focusIndex];
+
+    switch (e.key) {
+      case "j":
+        e.preventDefault();
+        e.stopPropagation();
+        moveFocus(gridColumns());
+        break;
+      case "k":
+        e.preventDefault();
+        e.stopPropagation();
+        moveFocus(-gridColumns());
+        break;
+      case "h":
+        e.preventDefault();
+        e.stopPropagation();
+        moveFocus(-1);
+        break;
+      case "l":
+        e.preventDefault();
+        e.stopPropagation();
+        moveFocus(1);
+        break;
+      case "G":
+        e.preventDefault();
+        e.stopPropagation();
+        focusLast();
+        break;
+      case "K":
+        e.preventDefault();
+        e.stopPropagation();
+        navigateUp();
+        break;
+      case "H":
+        e.preventDefault();
+        e.stopPropagation();
+        void siblingNav(-1);
+        break;
+      case "L":
+        e.preventDefault();
+        e.stopPropagation();
+        void siblingNav(1);
+        break;
+      case "g":
+        e.preventDefault();
+        e.stopPropagation();
+        setPending("g");
+        break;
+      case "d":
+        e.preventDefault();
+        e.stopPropagation();
+        setPending("d");
+        break;
+      case "y":
+        e.preventDefault();
+        e.stopPropagation();
+        setPending("y");
+        break;
+      case "p":
+        e.preventDefault();
+        e.stopPropagation();
+        void doPaste();
+        break;
+      case " ":
+        e.preventDefault();
+        e.stopPropagation();
+        toggleSelectionAt(focusIndex);
+        break;
+      case "v":
+        e.preventDefault();
+        e.stopPropagation();
+        toggleVisualMode();
+        break;
+      case "Enter":
+      case "o":
+        e.preventDefault();
+        e.stopPropagation();
+        if (f) openViewer(f);
+        break;
+      case "w":
+        // Same gate as the ⤓ button: META_EXTS, every tab (a read, not a write).
+        e.preventDefault();
+        e.stopPropagation();
+        if (f && META_EXTS.has((f.ext || "").toLowerCase())) void loadWorkflow(f);
+        break;
+      case "i":
+        // Same gate as the ⓘ button: META_EXTS, every tab (a read, not a write).
+        e.preventDefault();
+        e.stopPropagation();
+        if (f && META_EXTS.has((f.ext || "").toLowerCase())) void openMetadata(f);
+        break;
+      case "b":
+        // Safe View, global. Ungated by tab or by card — it is a family-wide
+        // display preference, not an affordance of the current location. The
+        // repaint comes from the kit's change bus (the settings write fires
+        // onChange), not from here, so this stays a one-liner.
+        e.preventDefault();
+        e.stopPropagation();
+        toggleSafeView();
+        break;
+      case "r":
+        // Per-card, like the ✎ button: the focused card's own root decides.
+        if (f && canWriteFile(f)) {
+          e.preventDefault();
+          e.stopPropagation();
+          void onRename(f);
+        }
+        break;
+      case "m":
+        // Moves the selection when one exists, else the focused file.
+        if (selected.size > 0 || (f && canWriteFile(f))) {
+          e.preventDefault();
+          e.stopPropagation();
+          void doMoveSelected();
+        }
+        break;
+      case "/":
+        e.preventDefault();
+        e.stopPropagation();
+        modal.searchEl.focus();
+        break;
+      case "?":
+        e.preventDefault();
+        e.stopPropagation();
+        showHelp();
+        break;
+      default:
+        break;
+    }
+  }
+
+  // Window capture fires BEFORE the shell's document capture, so ESC can be
+  // intercepted and stopPropagation'd to keep the modal open while selection
+  // is non-empty. Removed on close via the shell's onClose (see openModalShell)
+  // — the shell's real close paths bypass controller.close, so wrapping it
+  // would leak this listener.
+  window.addEventListener("keydown", onWindowKey, true);
+
+  /**
+   * Bring the pin list up before anything renders through it.
+   *
+   * Runs alongside the first loadAndRender rather than blocking it: the grid
+   * must not wait on the pin store, and renderPins() is called again here once
+   * the list lands. Wrapped whole — an unreachable store (or a migration that
+   * cannot finish) must leave a working browser with no pins, never a modal
+   * that fails to open.
+   */
+  async function initPins(): Promise<void> {
+    try {
+      await migrateLocalPins();
+      setPinCache((await fetchPins()).pins);
+      // The browser always opens on a directory tab (output), so the grid itself
+      // never depends on this — only the chip row and the per-card 📌 state do,
+      // and both are repainted without re-rendering (which would fight the
+      // first load's scroll restore; this lands at an unpredictable moment).
+      renderPins();
+      refreshPinButtons();
+    } catch (e) {
+      console.warn(`[${EXT_NAME}] pin list unavailable`, e);
+    }
+  }
+  void initPins();
+
+  loadAndRender();
+  if (savedView.recovered) {
+    notify({
+      severity: "warn",
+      summary: "Reopened in folder view",
+      detail: "The last flat-view load didn't finish, so the browser fell back to folder view.",
+    });
+  }
+  const pager=document.createElement('div'); pager.className='ah-pages';
+  if(options.listing) modal.toolbarEl.append(pager);
+  function renderPager(){
+    if(!options.listing)return;
+    pager.hidden=!lastListing?.token || state.type==='pinned' || state.type==='path';
+    if(pager.hidden)return;
+    const total=lastListing.total, count=Math.ceil(total/200), current=Math.floor(pageOffset/200)+1;
+    pager.innerHTML=`<button data-prev ${pageOffset===0?'disabled':''}>前へ</button><span>${total.toLocaleString()}件 · ${total?current:0}/${count}ページ</span><button data-next ${pageOffset+200>=total?'disabled':''}>次へ</button><span class="ah-note">${lastListing.skipped?' · 読取不可 '+lastListing.skipped+'件':''}</span>`;
+    pager.querySelector('[data-prev]')!.addEventListener('click',()=>{pageOffset=Math.max(0,pageOffset-200);void loadAndRender();});
+    pager.querySelector('[data-next]')!.addEventListener('click',()=>{pageOffset+=200;void loadAndRender();});
+  }
+  function updateAssets(records:any[]){
+    for(const f of state.files){
+      const r=records.find(r=>r.item.type===fileType(f)&&r.item.subfolder===fileSub(f)&&[r.item.name,r.target_name].includes(f.name));
+      if(!r)continue;
+      const oldKey=selectionKey(fileType(f),fileSub(f),f.name), wasSelected=selected.get(oldKey);
+      if(r.state==='compacted'){f.name=r.target_name;f.ext='.webp';f.size=r.webp_bytes;}
+      else if(r.state==='restored'){f.name=r.item.name;f.ext='.png';f.size=r.original_bytes;}
+      (f as any).asset=r;
+      if(wasSelected){selected.delete(oldKey);selected.set(selectionKey(fileType(f),fileSub(f),f.name),wasSelected);}
+    }
+    for(const card of fileCards()){
+      const f=renderedFiles[Number(card.dataset.idx)];if(!f)continue;
+      card.dataset.name=f.name;card.dataset.ext=f.ext||'';
+      const name=card.querySelector('.ib-name');if(name){name.textContent=f.name;name.setAttribute('title',f.name);}
+      options.decorateCard?.(card,{...f,type:fileType(f),subfolder:fileSub(f)});
+    }
+  }
+  options.mount?.({ modal, selection: collectSelectedOrFocused, refresh: async () => { clearSelection(); await loadAndRender({rescan:true}); }, selectAll:selectAllVisible, clearSelection, navigate:switchType, query:()=>lastQuery, pageItems:()=>state.files.map(f=>({type:fileType(f),subfolder:fileSub(f),name:f.name})), updateAssets });
+  return modal;
+}
+
+// ============================================================
+// Move-destination picker (folder navigator over the sandboxed roots)
+// ============================================================
+
+interface Destination {
+  type: BrowseType;
+  subfolder: string;
+}
+
+function pickDestination(
+  modal: ModalShellController,
+  start: Destination,
+  // When moving a folder, its own path — the picker hides that folder and its
+  // subtree (a folder can't be its own destination) and disables "Move here"
+  // on the folder's current parent (a no-op move).
+  exclude?: Destination,
+): Promise<Destination | null> {
+  return new Promise((resolve) => {
+    const ov = openShellOverlay(modal, { onDismiss: () => resolve(null) });
+    ov.card.classList.add("ib-move-card");
+
+    // The excluded folder's current parent — moving back there is a no-op.
+    const excludeParent = exclude
+      ? exclude.subfolder.includes("/")
+        ? exclude.subfolder.slice(0, exclude.subfolder.lastIndexOf("/"))
+        : ""
+      : "";
+    const inExcluded = (type: BrowseType, sub: string): boolean =>
+      exclude !== undefined &&
+      type === exclude.type &&
+      (sub === exclude.subfolder || sub.startsWith(`${exclude.subfolder}/`));
+
+    // Open at the last successful move destination (sorting a batch into the
+    // same folder is the common case); fall back to the current location.
+    const remembered = loadSavedDest();
+    const cur: Destination = remembered ?? {
+      type: SANDBOXED_TYPES.includes(start.type) ? start.type : "output",
+      subfolder: start.subfolder,
+    };
+
+    const title = document.createElement("div");
+    title.className = "cmp-ov-title";
+    title.textContent = "Move to…";
+
+    const tabs = document.createElement("div");
+    tabs.className = "ib-tabs";
+    for (const t of SANDBOXED_TYPES) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "ib-tab";
+      b.dataset.type = t;
+      b.textContent = t;
+      tabs.appendChild(b);
+    }
+
+    const crumbs = document.createElement("div");
+    crumbs.className = "ib-crumbs";
+    const list = document.createElement("div");
+    list.className = "ib-move-list";
+    const status = document.createElement("div");
+    status.className = "cmp-ov-msg";
+
+    const row = document.createElement("div");
+    row.className = "cmp-ov-actions";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "cmp-ov-btn";
+    cancel.textContent = "Cancel";
+    cancel.addEventListener("click", () => {
+      ov.close();
+      resolve(null);
+    });
+    const moveHere = document.createElement("button");
+    moveHere.type = "button";
+    moveHere.className = "cmp-ov-btn cmp-ov-primary";
+    moveHere.addEventListener("click", () => {
+      ov.close();
+      resolve({ type: cur.type, subfolder: cur.subfolder });
+    });
+    row.append(cancel, moveHere);
+
+    ov.card.append(title, tabs, crumbs, list, status, row);
+
+    function renderCrumbs(): void {
+      crumbs.innerHTML = "";
+      const mk = (text: string, sub: string) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "ib-crumb";
+        b.dataset.sub = sub;
+        b.textContent = text;
+        return b;
+      };
+      crumbs.appendChild(mk(cur.type, ""));
+      let acc = "";
+      for (const p of cur.subfolder.split("/").filter(Boolean)) {
+        acc = acc ? `${acc}/${p}` : p;
+        crumbs.appendChild(mk(p, acc));
+      }
+    }
+
+    async function load(): Promise<void> {
+      for (const b of tabs.querySelectorAll(".ib-tab"))
+        b.classList.toggle("is-active", (b as HTMLElement).dataset.type === cur.type);
+      renderCrumbs();
+      moveHere.textContent = `Move to ${cur.type}${cur.subfolder ? `/${cur.subfolder}` : ""}`;
+      // Disable "Move here" when the destination is the folder's current parent
+      // (no-op) or somehow inside its own subtree (defensive — the rows below
+      // are hidden, so this shouldn't be reachable by navigation).
+      const noop =
+        exclude !== undefined && cur.type === exclude.type && cur.subfolder === excludeParent;
+      moveHere.disabled = noop || inExcluded(cur.type, cur.subfolder);
+      list.innerHTML = "";
+      status.textContent = "Loading…";
+      try {
+        // `dirs` only — no `kind`, for the same reason as the sibling nav above:
+        // a destination picker that hid folders because of a media filter would
+        // make valid move targets unreachable.
+        const data = await fetchListing({ type: cur.type, subfolder: cur.subfolder });
+        // A remembered destination may have been deleted since — climb to the
+        // root of the same tab (which always exists) instead of a dead end.
+        if (!data.exists && cur.subfolder) {
+          cur.subfolder = "";
+          return load();
+        }
+        status.textContent = "";
+        // Pinned folders jump the picker straight to a frequent destination —
+        // the current location is omitted (moving here would be a no-op). Read
+        // from the module-level cache the browser keeps fresh, NOT re-fetched:
+        // this runs on every load() (tab, crumb, descend), and a request per
+        // navigation would be a round-trip in front of every folder tap.
+        for (const p of folderPins()) {
+          if (p.type === cur.type && p.subfolder === cur.subfolder) continue;
+          if (inExcluded(p.type, p.subfolder)) continue;
+          const r = document.createElement("button");
+          r.type = "button";
+          r.className = "ib-move-row is-pin";
+          r.dataset.pinType = p.type;
+          r.dataset.pinSub = p.subfolder;
+          r.textContent = `📌 ${pinLabel(p)}`;
+          list.appendChild(r);
+        }
+        if (cur.subfolder) {
+          const up = document.createElement("button");
+          up.type = "button";
+          up.className = "ib-move-row is-up";
+          up.textContent = "↑ ..";
+          list.appendChild(up);
+        }
+        if (!data.dirs.length && !cur.subfolder) {
+          const none = document.createElement("div");
+          none.className = "cmp-ov-msg";
+          none.textContent = "No subfolders — move into the root above.";
+          list.appendChild(none);
+        }
+        for (const d of data.dirs) {
+          const childSub = cur.subfolder ? `${cur.subfolder}/${d.name}` : d.name;
+          // Hide the folder being moved (and its subtree) — it can't be its own
+          // destination, and descending into it must be impossible.
+          if (inExcluded(cur.type, childSub)) continue;
+          const r = document.createElement("button");
+          r.type = "button";
+          r.className = "ib-move-row";
+          r.dataset.name = d.name;
+          r.textContent = `📁 ${d.name}`;
+          list.appendChild(r);
+        }
+      } catch (e) {
+        status.textContent = `Error: ${(e as Error).message}`;
+      }
+    }
+
+    tabs.addEventListener("click", (e) => {
+      const b = (e.target as HTMLElement).closest("[data-type]") as HTMLElement | null;
+      if (!b) return;
+      cur.type = b.dataset.type as BrowseType;
+      cur.subfolder = "";
+      load();
+    });
+    crumbs.addEventListener("click", (e) => {
+      const c = (e.target as HTMLElement).closest("[data-sub]") as HTMLElement | null;
+      if (!c) return;
+      cur.subfolder = c.dataset.sub || "";
+      load();
+    });
+    list.addEventListener("click", (e) => {
+      const pin = (e.target as HTMLElement).closest(".is-pin") as HTMLElement | null;
+      if (pin) {
+        const t = pin.dataset.pinType as BrowseType;
+        if (!SANDBOXED_TYPES.includes(t)) return;
+        cur.type = t;
+        cur.subfolder = pin.dataset.pinSub || "";
+        load();
+        return;
+      }
+      const up = (e.target as HTMLElement).closest(".is-up");
+      if (up) {
+        const p = cur.subfolder.replace(/\/+$/, "");
+        const i = p.lastIndexOf("/");
+        cur.subfolder = i <= 0 ? "" : p.slice(0, i);
+        load();
+        return;
+      }
+      const r = (e.target as HTMLElement).closest("[data-name]") as HTMLElement | null;
+      if (!r) return;
+      const base = cur.subfolder.replace(/\/+$/, "");
+      cur.subfolder = base ? `${base}/${r.dataset.name}` : (r.dataset.name as string);
+      load();
+    });
+
+    load();
+  });
+}
+
+// ============================================================
+// Sorting
+// ============================================================
+
+// ============================================================
+// Styles
+// ============================================================
+
+const BROWSER_CSS = `
+.ib-dialog {
+    width: 100vw !important; height: 100vh !important; max-height: 100vh !important;
+    /* Full-bleed: pin to the top-left instead of the shell's 50%/-50% centering.
+       On Android, 100vh is the LARGE viewport (URL bar hidden) — while the URL
+       bar is visible the dialog is taller than the visible area and centering
+       shoves the header off the top of the screen. */
+    top: 0 !important; left: 0 !important; transform: none !important;
+    border-radius: 0;
+    /* Keep the header/footer clear of notches + gesture bars in fullscreen. */
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+}
+@supports (height: 100dvh) {
+    /* Track the dynamic viewport (URL bar show/hide) where supported. */
+    .ib-dialog { height: 100dvh !important; max-height: 100dvh !important; }
+}
+.image-browser-body { display: block; }
+/* The pill look is shared by the root tabs and the media-type filter. Shared as
+   a comma selector rather than by giving the filter segments the .ib-tab class:
+   several tests count .ib-tab dialog-wide and select .ib-tab[data-type=…], so
+   reusing the class would make "four tabs" quietly stop meaning four tabs. */
+.ib-tabs, .ib-filter-group {
+    display: flex; flex-wrap: wrap; gap: 2px; align-items: center;
+    background: #1a1a22; border: 1px solid #2a2a32; border-radius: 4px; padding: 2px;
+}
+.ib-tab, .ib-filter-seg {
+    background: transparent; color: #8a8a92; border: 0; border-radius: 3px;
+    padding: 6px 12px; font-size: 12px; cursor: pointer; font-family: inherit;
+    text-transform: capitalize; min-height: 32px;
+}
+.ib-tab:hover, .ib-filter-seg:hover { background: #2a2a36; color: #e0e0e4; }
+.ib-tab.is-active, .ib-filter-seg.is-active { background: #2f3a52; color: #9ec6ff; }
+/* The filter's own full-width toolbar row. The row and the pill must be two
+   elements: flex-basis:100% is what breaks the line, and putting it on the pill
+   would stretch its border across the whole toolbar instead of hugging the
+   three segments. order:10 places it below the crumbs row (order:9 on phones)
+   and above the pins row (order:11). */
+/* The type filter and the density pill share this row; space-between puts one
+   at each end. */
+.ib-filter { order: 10; flex-basis: 100%; display: flex; justify-content: space-between; gap: 8px; }
+.ib-density-group {
+    display: flex; gap: 2px; align-items: center;
+    background: #1a1a22; border: 1px solid #2a2a32; border-radius: 4px; padding: 2px;
+}
+/* 44px in both axes — the family floor, same as .ib-act and .ib-check. A
+   toolbar control is exactly as mis-tappable as a card control. */
+.ib-density-seg {
+    background: transparent; color: #8a8a92; border: 0; border-radius: 3px;
+    min-width: 44px; min-height: 44px; padding: 0;
+    font-size: 15px; line-height: 1; cursor: pointer; font-family: inherit;
+}
+.ib-density-seg:hover { background: #2a2a36; color: #e0e0e4; }
+.ib-density-seg.is-active { background: #2f3a52; color: #9ec6ff; }
+.ib-crumbs { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; flex: 1; min-width: 0; }
+@media (max-width: 700px) {
+    /* Narrow screens: crumbs get their own full-width toolbar row. Squeezed to
+       the flex leftovers, the crumb buttons overflow their container and paint
+       underneath the sort dropdown. */
+    .ib-crumbs { order: 9; flex-basis: 100%; }
+}
+.ib-crumb {
+    background: #2a2a36; color: #b8b8c0; border: 1px solid #3a3a44; border-radius: 4px;
+    padding: 6px 10px; font-size: 12px; cursor: pointer; font-family: inherit; min-height: 32px;
+}
+.ib-crumb:hover { background: #3a3a4a; color: #fff; }
+.ib-control {
+    background: #2a2a36; color: #d8d8dc; border: 1px solid #3a3a44; border-radius: 4px;
+    padding: 6px 8px; font-size: 12px; cursor: pointer; font-family: inherit; min-height: 32px;
+}
+.ib-control:hover { background: #3a3a4a; color: #fff; }
+.ib-icon { min-width: 34px; text-align: center; }
+/* The upload picker: present for click(), invisible and untouchable. */
+.ib-upload-input {
+  position: absolute; width: 1px; height: 1px; opacity: 0;
+  pointer-events: none; overflow: hidden;
+}
+.ib-upload-where { opacity: 0.75; word-break: break-all; }
+.ib-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 10px; padding: 4px;
+}
+/* ---- Density steps -------------------------------------------------------
+   The rule above is the DEFAULT step and is deliberately left untouched:
+   card-actions.test.js reads its grid-template-columns back verbatim and
+   asserts the INLINE_ACTION_SLOTS arithmetic against a hardcoded 150px card.
+   Everything below is additive and scoped to an attribute. */
+
+/* DENSE — thumb and checkbox only. The action row is not shrunk, it is REMOVED:
+   floor((84 - 12 + 2) / (44 + 2)) = 1, i.e. a card whose only control would be
+   the ⋯ that costs a slot itself. Per-item actions at this step go through the
+   checkbox into the batch bar, or through the lightbox. Hiding the row is also
+   what keeps INLINE_ACTION_SLOTS a constant — a test asserts these are display:
+   none so a future edit that un-hides them at 84px trips rather than shipping
+   sub-44px destructive buttons (#90 again). */
+.ib-grid[data-density="dense"] {
+    grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
+    gap: 6px;
+    /* Cards take their natural height. Without this a file card sharing a row
+       with a (two-column, still-named) folder card is stretched to the folder's
+       height — measured at 209px against the 87px the thumb actually needs, so
+       the first row rendered as mostly empty boxes. */
+    align-items: start;
+}
+.ib-grid[data-density="dense"] .ib-actions,
+.ib-grid[data-density="dense"] .ib-stars,
+.ib-grid[data-density="dense"] .ib-meta,
+.ib-grid[data-density="dense"] .ib-card.is-file .ib-name { display: none; }
+/* A FOLDER keeps its name and spans two columns. Directories are half of the
+   truncation complaint this density scale sits next to, and a nameless folder
+   is not a smaller folder card, it is an unusable one. */
+.ib-grid[data-density="dense"] .ib-card.is-dir { grid-column: span 2; }
+/* ...and the icon block shrinks WITH the step. Keeping the name never required
+   keeping the icon block: at span 2 the folder sits on a 84x2+6 = ~180px track,
+   so the square reserved a ~180px-tall box for a 32px glyph and the folder card
+   came out at 209px against the file tile's 87px — 2.4x, at the step whose
+   whole job is fitting more on screen (#106). 44px is the family's tap-target
+   floor and comfortably holds the glyph. */
+.ib-grid[data-density="dense"] .ib-card.is-up .ib-thumb,
+.ib-grid[data-density="dense"] .ib-card.is-dir .ib-thumb { height: 44px; }
+/* Vertical scroll must survive a finger that starts on a checkbox. .ib-check is
+   touch-action:none so a drag sweeps a range, and at 44px on an ~84px tile that
+   is half the card width — scoped to this step, so the default is untouched.
+   pan-y gives the browser the vertical axis back; a horizontal-first drag still
+   sweeps, which is the natural direction across a grid row. */
+.ib-grid[data-density="dense"] .ib-check { touch-action: pan-y; }
+
+/* LIST — one ITEM per row, not one image. A single-column grid of the DEFAULT
+   card would be a ~390px-tall square showing one file, which openFull already
+   does better; the point of the step is the details beside the thumb. Pure CSS
+   over the existing markup, so there is no second card template to keep in
+   sync.
+
+   Scoped to .ib-card, NOT .ib-card.is-file: a folder is an ITEM, so "one item
+   per row" has to mean folders too. Scoping the row layout to files is what
+   left a folder card as a full-width square at this step — 395px inside a
+   412px band, i.e. one folder filling the whole visible grid (#106). The dir
+   card's markup is a strict subset of the file card's (thumb + name, no
+   meta/stars/actions), so the shared template needs no dir-specific block; the
+   unused areas collapse to zero-height rows. */
+.ib-grid[data-density="list"] { grid-template-columns: 1fr; }
+.ib-grid[data-density="list"] .ib-card {
+    display: grid;
+    grid-template-columns: 64px minmax(0, 1fr);
+    grid-template-areas:
+        "sub   sub"
+        "thumb name"
+        "thumb meta"
+        "thumb stars"
+        "thumb acts";
+    align-items: start;
+    column-gap: 8px;
+}
+.ib-grid[data-density="list"] .ib-card .ib-subpath { grid-area: sub; }
+.ib-grid[data-density="list"] .ib-card .ib-thumb { grid-area: thumb; }
+.ib-grid[data-density="list"] .ib-card .ib-name { grid-area: name; }
+.ib-grid[data-density="list"] .ib-card .ib-meta { grid-area: meta; }
+.ib-grid[data-density="list"] .ib-card .ib-stars { grid-area: stars; }
+.ib-grid[data-density="list"] .ib-card .ib-actions { grid-area: acts; }
+/* Two children are appended AFTER the template and would otherwise auto-place
+   into a new implicit row: the reveal button applySafeView adds, and the
+   selection checkbox. Both are absolutely positioned over the thumb, which
+   works because .ib-card is already position:relative — the explicit grid-area
+   is what stops the grid reserving a row for them. */
+.ib-grid[data-density="list"] .ib-card .cmk-sv-reveal,
+.ib-grid[data-density="list"] .ib-card .ib-check { grid-area: thumb; }
+/* The row is far wider than 150px, so the name has room to wrap rather than
+   elide — the one place the two-span split is not needed. */
+.ib-grid[data-density="list"] .ib-name { display: block; white-space: normal; }
+.ib-grid[data-density="list"] .ib-name-head { white-space: normal; overflow: visible; }
+/* The file thumb is 64px tall because the 64px column plus aspect-ratio 1/1
+   says so. A folder's is not square (see below), so its cap is stated. */
+.ib-grid[data-density="list"] .ib-card.is-up .ib-thumb,
+.ib-grid[data-density="list"] .ib-card.is-dir .ib-thumb { height: 64px; }
+.ib-card {
+    background: #21212a; border: 1px solid #2a2a32; border-radius: 6px; overflow: hidden;
+    cursor: pointer; display: flex; flex-direction: column;
+    transition: transform 0.06s ease, border-color 0.1s ease;
+    /* Anchor for the corner overlays (selection check / folder delete); the
+       text-selection + touch-callout suppression keeps long-press clean. */
+    position: relative;
+    user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+}
+.ib-card:hover { border-color: #6ba6ff; transform: translateY(-1px); }
+.ib-card.is-up, .ib-card.is-dir { background: #1f1f26; }
+/* A FOLDER CARD DOES NOT TAKE ITS ROW'S HEIGHT. The grid stretches items by
+   default, so a folder sharing a row with a file card was pulled to the file's
+   height — measured 313px for the ".." card inside a subfolder, against the
+   ~207px it needs. Scoped to the card rather than added to .ib-grid, because
+   the base .ib-grid rule is read back verbatim by card-actions.test.js. */
+.ib-card.is-up, .ib-card.is-dir { align-self: start; }
+.ib-thumb {
+    aspect-ratio: 1 / 1; display: flex; align-items: center; justify-content: center;
+    background: #12121a; overflow: hidden;
+}
+/* ...but NOT on a folder or the ".." card. The square is what a photo wants; a
+   folder's icon block holds a 32px glyph, so on the default 178px track it
+   reserved a 178px-tall box that was ~91% empty — and, because the box tracks
+   the TRACK, every compaction step made a folder card bigger rather than
+   smaller (#106). Bounded height per step instead: 88 / 44 / 64 for
+   grid / dense / list, each stated in its own block. */
+.ib-card.is-up .ib-thumb,
+.ib-card.is-dir .ib-thumb { aspect-ratio: auto; height: 88px; }
+.ib-thumb-icon { font-size: 32px; color: #777; }
+.ib-thumb img, .ib-thumb video {
+    width: 100%; height: 100%; object-fit: cover; display: block; background: #000;
+}
+/* Two spans, so the browser elides the HEAD at whatever the real track width is
+   and the TAIL — the part that identifies the file — never elides. At a wide
+   track the head does not overflow and the whole name renders unmarked. See
+   src/label.ts for why this is not a computed character budget. */
+.ib-name {
+    padding: 6px 8px; font-size: 11.5px; color: #d8d8dc;
+    display: flex; min-width: 0; overflow: hidden;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+.ib-name-head {
+    flex: 0 1 auto; min-width: 0;
+    white-space: nowrap; text-overflow: ellipsis; overflow: hidden;
+}
+.ib-name-tail { flex: 0 0 auto; white-space: nowrap; }
+/* NEITHER SPAN MAY SET ITS OWN color. Safe View's spoiler paints
+   color:transparent on the CONTAINER and the spans inherit it; a colour here
+   would leak a hidden name into the clear inside its own block. An explicit
+   .cmk-sv-spoiler span rule was tried and
+   removed — the mutation table showed it changed nothing, because inheritance
+   already does the work. tests/mutations-label.json mutates a colour ONTO
+   .ib-name-head instead, which is the failure that can actually happen. */
+.ib-meta { padding: 0 8px 4px; font-size: 10.5px; color: #888; }
+/* Flat-view folder label above the thumbnail — a tap jumps to that folder. */
+.ib-subpath {
+    display: flex; width: 100%; text-align: left; box-sizing: border-box;
+    padding: 5px 8px; font-size: 10px; line-height: 1.3; min-height: 26px;
+    color: #8a9bb5; background: transparent; border: 0;
+    border-bottom: 1px solid #2a2a32;
+    white-space: nowrap; text-overflow: ellipsis; overflow: hidden;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; cursor: pointer;
+}
+.ib-subpath:hover { color: #9ec6ff; background: #23232e; }
+.ib-subpath.is-root { color: #555; cursor: default; }
+.ib-subpath.is-root:hover { background: transparent; color: #555; }
+.ib-stars { display: flex; justify-content: center; gap: 1px; padding: 0 6px 4px; }
+.ib-star {
+    appearance: none; background: transparent; border: 0; padding: 5px 4px;
+    font-size: 15px; line-height: 1; color: #555; cursor: pointer;
+    min-width: 26px; min-height: 26px;
+}
+.ib-star.is-on, .ib-star:hover { color: #ffd866; }
+@media (max-width: 600px) {
+    .ib-star { font-size: 18px; padding: 7px 5px; min-width: 30px; min-height: 32px; }
+}
+.ib-stars.is-ro { color: #ffd866; font-size: 12px; cursor: default; }
+/* The card action row. The gap and the horizontal padding here are two of the
+   four constants INLINE_ACTION_SLOTS is computed from — change one and the
+   budget is wrong, so tests/js/card-actions.test.js reads them back out of
+   this stylesheet rather than trusting the TS literals. */
+.ib-actions { display: flex; gap: 2px; padding: 0 6px 6px; margin-top: auto; }
+/* min-width AND min-height at the family's >=44px D02 floor (the kit hardcodes
+   the same number in modal-shell.ts and hub.ts). flex:1 still lets a button
+   GROW on a wide card; what it may no longer do is shrink below the floor —
+   which is what put eight ~15px buttons, delete among them, on a 150px card.
+   The count is bounded by actionRowHTML so the floor cannot overflow the row. */
+.ib-act {
+    flex: 1; background: #2a2a36; color: #b8b8c0; border: 1px solid #33333f; border-radius: 4px;
+    padding: 6px 0; font-size: 13px; line-height: 1; cursor: pointer; font-family: inherit;
+    min-width: 44px; min-height: 44px;
+}
+.ib-act:hover { background: #3a3a4a; color: #fff; }
+.ib-act-danger:hover { background: #5c2a3c; color: #ff9eb0; }
+/* Overflow. The stash holds the controls the budget pushed out; it is the
+   sheet's source of truth, never rendered. display:none rather than only the
+   hidden attribute, because .ib-act above sets a min-width that would
+   otherwise still occupy the row in a browser that ignores hidden. */
+.ib-more-stash { display: none; }
+.ib-more-card { width: min(420px, calc(100% - 24px)); }
+/* The sheet's title is the one TOUCH-reachable place the untouched filename
+   appears (the card's title attribute needs a hover). The kit's .cmp-ov-title
+   sets no wrapping, and a ComfyUI output name is one unbroken token except for
+   its hyphens — so a name joined only by underscores would overflow the card
+   rather than wrap, and the full-name surface would truncate too. */
+.ib-more-card .cmp-ov-title { overflow-wrap: anywhere; }
+.ib-more-list {
+    display: flex; flex-direction: column; gap: 2px; max-height: 60vh; overflow-y: auto;
+    border: 1px solid #2a2a32; border-radius: 6px; padding: 4px; background: #17171e;
+}
+/* Full-width rows, comfortably over the floor — the point of the sheet is that
+   a destructive action is a deliberate second tap on a large target instead of
+   a 15px neighbour of ✎ rename. */
+.ib-more-row {
+    display: flex; align-items: center; gap: 10px; text-align: left; width: 100%;
+    background: transparent; color: #cfcfd6; border: 0; border-radius: 4px;
+    padding: 10px 12px; font-size: 14px; cursor: pointer; font-family: inherit;
+    min-width: 44px; min-height: 44px;
+}
+.ib-more-row:hover { background: #2a2a3a; color: #fff; }
+.ib-more-glyph { display: inline-block; min-width: 20px; text-align: center; font-size: 15px; }
+.ib-more-danger { color: #ff9eb0; }
+.ib-more-danger:hover { background: #5c2a3c; color: #fff; }
+.ib-empty { grid-column: 1 / -1; padding: 48px; text-align: center; color: #777; font-style: italic; }
+.ib-count { color: #888; }
+.ib-move-card { width: min(560px, calc(100% - 24px)); }
+.ib-move-list {
+    display: flex; flex-direction: column; gap: 2px; max-height: 40vh; overflow-y: auto;
+    border: 1px solid #2a2a32; border-radius: 6px; padding: 4px; background: #17171e;
+}
+.ib-move-row {
+    text-align: left; background: transparent; color: #cfcfd6; border: 0; border-radius: 4px;
+    padding: 10px 12px; font-size: 13px; cursor: pointer; font-family: inherit; min-height: 40px;
+}
+.ib-move-row:hover { background: #2a2a3a; color: #fff; }
+/* "Move here" is disabled on a folder's own parent/subtree (a no-op or illegal
+   destination) — dim it so the reason for the dead button is legible. */
+.ib-move-card .cmp-ov-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+.cmp-match { color: #ffd866; font-weight: 700; }
+.ib-card.is-focused { outline: 2px solid #6ba6ff; outline-offset: -2px; z-index: 1; }
+.ib-card.is-selected { border-color: #ffd866; background: #2a2a1f; }
+.ib-card.is-selected.is-focused { outline-color: #ffd866; }
+/* Selection checkbox — the touch affordance for multi-select. Hidden until
+   hover on fine pointers; always visible on touch, in select mode, and on
+   already-selected cards. touch-action:none makes a drag starting here a
+   range-select instead of a scroll. */
+/* 34px visible dot inside a 44px HIT BOX. The dot is drawn by ::before so the
+   button itself can carry the family's 44px floor (the same one .ib-act is held
+   to) without a filled 44px circle covering a quarter of the thumbnail. A miss
+   here is not inert — it falls through to the card, which opens the file. */
+.ib-check {
+    position: absolute; top: 0; left: 0; z-index: 2;
+    width: 44px; height: 44px; min-width: 44px; min-height: 44px;
+    padding: 0; border: 0; background: none; border-radius: 50%;
+    color: transparent; font-size: 16px; line-height: 1; cursor: pointer;
+    display: none; align-items: center; justify-content: center;
+    touch-action: none; -webkit-tap-highlight-color: transparent;
+}
+.ib-check::before {
+    content: ""; position: absolute; z-index: -1;
+    width: 34px; height: 34px; box-sizing: border-box; border-radius: 50%;
+    border: 2px solid rgba(255, 255, 255, 0.7); background: rgba(0, 0, 0, 0.45);
+}
+.ib-card:hover .ib-check,
+.ib-card.is-selected .ib-check,
+.ib-dialog.is-selecting .ib-check { display: flex; }
+@media (pointer: coarse) { .ib-check { display: flex; } }
+.ib-check:hover::before { border-color: #ffd866; }
+.ib-check:hover { color: rgba(255, 255, 255, 0.85); }
+.ib-card.is-selected .ib-check::before { background: #ffd866; border-color: #ffd866; }
+.ib-card.is-selected .ib-check { color: #1a1a22; }
+.ib-select-toggle.is-active { background: #2f3a52; color: #9ec6ff; border-color: #4a5878; }
+.ib-view-toggle.is-active { background: #2f3a52; color: #9ec6ff; border-color: #4a5878; }
+/* Keep the selection checkbox over the thumbnail corner, below the subpath row.
+   25px, not 30px: the 44px hit box centres its 34px dot at +5px, so the DOT
+   still lands at 30px — one below .ib-subpath's 26px min-height plus its 4px
+   gutter, which is what this constant is really anchored to. */
+.ib-card.is-flat .ib-check { top: 25px; }
+.ib-pin-toggle.is-active { background: #52452f; color: #ffd866; border-color: #78683a; }
+/* Safe View's toolbar toggle. Deliberately NOT the blue "a mode is on" tint the
+   flat/select toggles use — this one says "content is being withheld", and
+   reading it at a glance is the whole point of having it in the toolbar rather
+   than only in the settings dialog. */
+.ib-safe-toggle.is-active { background: #2f3a2f; color: #8fd38f; border-color: #3f5a3f; }
+/* The reveal 👁 is a child of the CARD, not of the blurred thumbnail — the blur
+   is a filter on .ib-thumb and would otherwise blur its own escape hatch. It
+   shares the checkbox's corner, so it sits on the opposite side; both drop
+   below the subpath row on flat/pinned cards for the same reason. */
+.ib-card .cmk-sv-reveal { left: auto; right: 4px; }
+.ib-card.is-flat .cmk-sv-reveal { top: 30px; }
+/* A hidden card must not read as a hover target for its own name. */
+.ib-card.is-safe-hidden .ib-name, .ib-card.is-safe-hidden .ib-subpath { cursor: default; }
+/* Pinned-folder chips — a full-width toolbar row of one-tap destinations.
+   order:11 keeps them last when the toolbar wraps on phones, below both the
+   crumbs row (order:9) and the media-type filter row (order:10). */
+.ib-pins {
+    order: 11; flex-basis: 100%;
+    display: flex; flex-wrap: wrap; gap: 4px; align-items: center;
+}
+/* The slow-load note: a full-width row under everything else (order:12), so it
+   wraps as a sentence instead of being clipped beside the search input.
+   [hidden] is restated because the display rule would otherwise beat the UA's. */
+.ib-load-note {
+    order: 12; flex-basis: 100%;
+    font-size: 13px; line-height: 1.4; color: #c8b06a;
+}
+.ib-load-note[hidden] { display: none; }
+.ib-pin-chip { display: inline-flex; align-items: stretch; }
+.ib-pin-go {
+    background: #23283a; color: #9ec6ff; border: 1px solid #3a4560; border-right: 0;
+    border-radius: 4px 0 0 4px; padding: 6px 8px; font-size: 12px; cursor: pointer;
+    font-family: inherit; min-height: 32px; max-width: 45vw;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ib-pin-go:hover { background: #2f3a52; color: #fff; }
+.ib-pin-chip.is-current .ib-pin-go { color: #ffd866; border-color: #78683a; }
+.ib-pin-chip.is-current .ib-pin-x { border-color: #78683a; }
+.ib-pin-x {
+    background: #23283a; color: #667; border: 1px solid #3a4560;
+    border-radius: 0 4px 4px 0; padding: 6px 8px; font-size: 11px; cursor: pointer;
+    font-family: inherit; min-height: 32px; min-width: 28px;
+}
+.ib-pin-x:hover { background: #5c2a3c; color: #ff9eb0; }
+.ib-move-row.is-pin { color: #9ec6ff; }
+/* Per-card 📌 — filled while the file is pinned, matching the toolbar toggle's
+   active look so "pinned" reads the same in both places. */
+.ib-act-pin.is-pinned { background: #52452f; color: #ffd866; border-color: #78683a; }
+/* Per-card 🙈 — filled while the file carries the keyword, same "this state is
+   on" language as 📌 above, in the warning hue the Safe View toggle uses.
+   It lives in .ib-actions, a SIBLING of .ib-thumb, so the blur applied to a
+   matched thumbnail never reaches it — marking a file must not blur the control
+   that unmarks it. A class rule with no min()/calc(), so getComputedStyle can
+   read it in jsdom. */
+.ib-act-mark.is-marked { background: #4a2530; color: #ff9eb0; border-color: #7a4a58; }
+.ib-act-mark:disabled { cursor: progress; opacity: 0.5; }
+/* A pin whose target is gone. Dimmed rather than hidden: "the file moved" and
+   "you never pinned it" are different facts, so the card stays — with only its
+   unpin affordance — until it is pruned. */
+.ib-card.is-missing { opacity: 0.45; }
+.ib-card.is-missing:hover { border-color: #78384a; transform: none; }
+.ib-card.is-missing .ib-meta { color: #c07a8a; font-style: italic; }
+.ib-prune { white-space: nowrap; }
+.ib-scan-pill { white-space: nowrap; color: #c8b06a; border-color: #4a4230; }
+/* Folder delete — corner overlay on dir cards (write-gated). */
+.ib-dir-del {
+    position: absolute; top: 4px; right: 4px; z-index: 2;
+    width: 34px; height: 34px; padding: 0; border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.2); background: rgba(0, 0, 0, 0.45);
+    color: #b8b8c0; font-size: 14px; line-height: 1; cursor: pointer;
+}
+.ib-dir-del:hover { background: #5c2a3c; color: #ff9eb0; }
+/* Folder move — corner overlay on dir cards, mirroring the delete button on the
+   opposite side (write-gated). */
+.ib-dir-move {
+    position: absolute; top: 4px; left: 4px; z-index: 2;
+    width: 34px; height: 34px; padding: 0; border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.2); background: rgba(0, 0, 0, 0.45);
+    color: #b8b8c0; font-size: 14px; line-height: 1; cursor: pointer;
+}
+.ib-dir-move:hover { background: #3a3a4a; color: #fff; }
+/* Floating batch-action bar — appears while a selection exists. */
+.ib-selbar {
+    position: absolute; left: 50%; transform: translateX(-50%);
+    bottom: calc(52px + env(safe-area-inset-bottom, 0px));
+    z-index: 4; display: none; align-items: center; gap: 8px;
+    max-width: calc(100% - 16px); white-space: nowrap;
+    background: #1c1c24; border: 1px solid #3a3a44; border-radius: 24px;
+    padding: 8px 12px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+.ib-selbar.is-visible { display: flex; }
+.ib-selbar-count { font-size: 12.5px; font-weight: 600; color: #9ec6ff; padding: 0 4px; }
+.ib-selbar-btn {
+    background: #2a2a36; color: #d8d8dc; border: 1px solid #3a3a44; border-radius: 16px;
+    padding: 8px 14px; font-size: 13px; cursor: pointer; font-family: inherit; min-height: 38px;
+}
+.ib-selbar-btn:hover { background: #3a3a4a; color: #fff; }
+.ib-selbar-danger { background: #4a2230; color: #ff9eb0; border-color: #78384a; }
+.ib-selbar-danger:hover { background: #5c2a3c; color: #fff; }
+.ib-dialog.is-visual .ib-grid { outline: 2px solid #ffd866; outline-offset: -2px; }
+.ib-selected-badge {
+    background: #2f3a52; color: #9ec6ff; border: 1px solid #4a5878; border-radius: 10px;
+    padding: 2px 8px; font-size: 11px; margin-left: 8px; display: inline;
+}
+.ib-help-card { width: min(640px, calc(100% - 24px)); max-height: calc(100% - 24px); }
+.ib-help-body {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 12px; overflow-y: auto; padding: 8px 0;
+}
+.ib-help-col { display: flex; flex-direction: column; gap: 4px; }
+.ib-help-h { font-size: 12px; font-weight: 600; color: #9ec6ff; text-transform: uppercase; letter-spacing: 0.5px; }
+.ib-help-body dl { margin: 0; display: flex; flex-direction: column; gap: 2px; }
+.ib-help-body dt {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 11.5px; color: #ffd866;
+}
+.ib-help-body dd { margin: 0 0 4px 0; font-size: 11.5px; color: #b8b8c0; }
+/* Metadata overlay (the ⓘ card). The ib-meta-* namespace is distinct from the
+   card's own .ib-meta dimensions line — class selectors match whole tokens, so
+   .ib-meta never catches .ib-meta-row and vice versa. */
+.ib-meta-card { width: min(680px, calc(100% - 24px)); max-height: calc(100% - 24px); }
+.ib-meta-body {
+    display: flex; flex-direction: column; gap: 8px;
+    overflow-y: auto; padding: 8px 0; -webkit-overflow-scrolling: touch;
+}
+.ib-meta-status { padding: 14px 2px; font-size: 12.5px; color: #888; font-style: italic; }
+.ib-meta-src {
+    display: flex; align-items: baseline; gap: 8px; font-size: 11.5px; color: #9ec6ff;
+    text-transform: uppercase; letter-spacing: 0.5px;
+}
+.ib-meta-fmt { color: #777; text-transform: none; letter-spacing: 0; }
+.ib-meta-row { display: grid; grid-template-columns: 84px 1fr auto; gap: 8px; align-items: start; }
+.ib-meta-k {
+    padding-top: 7px; font-size: 11px; color: #8a8a92;
+    text-transform: uppercase; letter-spacing: 0.4px;
+}
+.ib-meta-v {
+    /* A long positive prompt scrolls inside its own box instead of pushing the
+       Copy buttons and the overlay actions off the card. Selectable: the card is
+       a reading surface, unlike the grid (which suppresses selection for
+       long-press). */
+    max-height: 7.5em; overflow-y: auto;
+    padding: 6px 8px; font-size: 12px; line-height: 1.45; color: #d8d8dc;
+    background: #17171e; border: 1px solid #2a2a32; border-radius: 4px;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+    user-select: text; -webkit-user-select: text;
+}
+.ib-meta-copy {
+    background: #2a2a36; color: #b8b8c0; border: 1px solid #33333f; border-radius: 4px;
+    padding: 0 10px; font-size: 12px; cursor: pointer; font-family: inherit; min-height: 32px;
+}
+.ib-meta-copy:hover { background: #3a3a4a; color: #fff; }
+.ib-meta-copy.is-copied { background: #25402f; color: #8fe0a8; border-color: #37624a; }
+.ib-meta-empty { padding: 16px 2px; font-size: 12.5px; color: #777; font-style: italic; }
+.ib-meta-note { font-size: 11.5px; color: #c8a95c; }
+.ib-meta-raw > summary {
+    padding: 7px 0; font-size: 12px; color: #9ec6ff; cursor: pointer; min-height: 32px;
+}
+.ib-meta-raw pre {
+    margin: 4px 0 8px; padding: 8px; max-height: 30vh; overflow: auto;
+    background: #17171e; border: 1px solid #2a2a32; border-radius: 4px;
+    font-size: 11px; color: #b8b8c0; white-space: pre-wrap; overflow-wrap: anywhere;
+    user-select: text; -webkit-user-select: text;
+}
+@media (max-width: 600px) {
+    /* Stack the label above the value — an 84px gutter leaves the prompt column
+       unreadably narrow on a phone. */
+    .ib-meta-row { grid-template-columns: 1fr auto; }
+    .ib-meta-k { grid-column: 1 / -1; padding-top: 0; }
+}
+`;

@@ -1,0 +1,24 @@
+{
+  "name": "comfy-asset-hub",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test:progress": "node scripts/test-progress.mjs",
+    "qa": "node scripts/qa.mjs",
+    "qa:scale": "node scripts/qa-scale.mjs",
+    "qa:selection": "node scripts/qa-selection.mjs",
+    "qa:resume": "node scripts/qa-resume.mjs",
+    "qa:space": "node scripts/qa-space.mjs",
+    "qa:cpu": "node scripts/qa-cpu.mjs",
+    "qa:entry": "node scripts/qa-entry.mjs",
+    "qa:relations": "node scripts/qa-relations.mjs"
+  },
+  "dependencies": {
+    "@laurigates/comfy-modal-kit": "0.14.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.27.0",
+    "playwright": "1.56.1"
+  }
+}
