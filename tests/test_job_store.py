@@ -10,6 +10,22 @@ from jobs import run_parallel
 
 
 class DurableJobsTests(unittest.TestCase):
+    def test_legacy_migration_preserves_explicit_targets_but_not_implicit_default(self):
+        self.assertEqual(self.db.performance()['mode'], 'normal')
+        with closing(self.db.connect()) as db:
+            db.execute("INSERT OR REPLACE INTO settings VALUES ('background','true')")
+            db.execute("INSERT OR REPLACE INTO settings VALUES ('workers','16')")
+            db.commit()
+        self.assertEqual(self.db.performance(), dict(mode='normal', cpu_target=None, workers=16))
+        with closing(self.db.connect()) as db:
+            db.execute("INSERT OR REPLACE INTO settings VALUES ('cpu_target','90')")
+            db.commit()
+        self.assertEqual(self.db.performance(), dict(mode='cpu', cpu_target=90, workers=16))
+        self.db.set_performance(None, 16, 'background')
+        self.assertEqual(JobStore(self.path).performance(), dict(mode='background', cpu_target=None, workers=16))
+        self.db.set_performance(None, 8, 'normal')
+        self.assertEqual(JobStore(self.path).performance(), dict(mode='normal', cpu_target=None, workers=8))
+
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -36,17 +52,17 @@ class DurableJobsTests(unittest.TestCase):
             recovered.resume(job['id'], False, lambda _: [1])
 
     def test_performance_settings_survive_restart_and_update_active_jobs(self):
-        self.assertEqual(self.db.performance(), dict(cpu_target=70, workers=4))
+        self.assertEqual(self.db.performance(), dict(mode="normal", cpu_target=None, workers=4))
         job = self.db.create('archive', [{'name': 'a'}], 4, True, lambda _: None)
         self.db.state(job['id'], 'running')
         self.db.set_performance(90, 16)
         self.assertEqual(self.db.get(job['id'])['workers'], 16)
         recovered = JobStore(self.path)
-        self.assertEqual(recovered.performance(), dict(cpu_target=90, workers=16))
+        self.assertEqual(recovered.performance(), dict(mode="cpu", cpu_target=90, workers=16))
         recovered.set_performance(None, 8)
-        self.assertEqual(JobStore(self.path).performance(), dict(cpu_target=None, workers=8))
+        self.assertEqual(JobStore(self.path).performance(), dict(mode="normal", cpu_target=None, workers=8))
         recovered.set_background(True)
-        self.assertEqual(recovered.performance(), dict(cpu_target=90, workers=8))
+        self.assertEqual(recovered.performance(), dict(mode="cpu", cpu_target=90, workers=8))
 
     def test_all_errors_persist_and_retry_excludes_successes(self):
         job = self.db.create('archive', [{'name': str(i)} for i in range(127)], 4, True, lambda _: [1])
@@ -106,6 +122,29 @@ class DurableJobsTests(unittest.TestCase):
 
 
 class BackgroundTests(unittest.TestCase):
+    def test_os_modes_use_full_concurrency_at_high_cpu_and_keep_memory_guard(self):
+        load, clock = [99, 4 * 1024**3], [0]
+        for mode in ('normal', 'background'):
+            job = dict(mode=mode, workers=16, cpu_target=30, background=True)
+            gate = BackgroundLimit(job, lambda: tuple(load), lambda: clock[0])
+            self.assertEqual(gate(), 16)
+            clock[0] += 2
+            self.assertEqual(gate(), 16)
+            self.assertEqual(job['wait_reason'], '')
+            load[1] = 512 * 1024**2
+            clock[0] += 2
+            self.assertEqual(gate(), 0)
+            load[1] = 4 * 1024**3
+            clock[0] += 2
+            self.assertEqual(gate(), 16)
+            job['mode'] = 'cpu'
+            for _ in range(5):
+                clock[0] += 2
+                gate()
+            self.assertEqual(gate(), 0)
+            job['mode'] = mode
+            self.assertEqual(gate(), 16)
+
     def test_cpu_memory_and_recovery(self):
         sample = [0, 4 * 1024**3]
         clock = [0]

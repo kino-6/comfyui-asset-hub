@@ -29,9 +29,10 @@ export class ProgressPanel {
  constructor(parent:HTMLElement, actions:ProgressActions){
   this.element.className='ah-toolbar';
   this.element.innerHTML=`
-   <select data-cpu-target aria-label="CPU目標" title="PC全体のCPU使用率の目安。画像生成中もCPU・メモリの余裕に応じて圧縮を続けます。全速はCPU調整を解除します。変更は処理中にも反映します。">
+   <select data-cpu-target aria-label="処理モード" title="通常：指定並列数で実行。他作業優先：指定並列数のまま圧縮子プロセスを低優先度にします（Windows、次の画像から）。CPU目標指定時だけ並列数を自動調整します。">
+    <option value="normal" selected>通常</option><option value="background">他作業優先</option>
     <option value="30">CPU目標 30%</option><option value="50">CPU目標 50%</option>
-    <option value="70" selected>CPU目標 70%</option><option value="90">CPU目標 90%</option><option value="full">全速</option>
+    <option value="70">CPU目標 70%</option><option value="90">CPU目標 90%</option>
    </select>
    <span data-cpu-current class="ah-detail" title="PC全体の実測CPU使用率。2秒間隔で取得します。"></span>
    <span data-total-progress class="ah-total-meter" hidden>全体<progress class="ah-run-meter" aria-label="全体の処理進捗" max="1" value="0" hidden></progress></span>

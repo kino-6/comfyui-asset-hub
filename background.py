@@ -19,13 +19,14 @@ class BackgroundLimit:
         self.settings = self.configuration()
 
     def configuration(self):
-        return self.job.get('background', True), self.job.get('cpu_target', 70), self.job['workers']
+        mode = self.job.get('mode', 'cpu' if self.job.get('background', False) else 'normal')
+        return mode, self.job.get('cpu_target', 70), self.job['workers']
 
     def __call__(self):
         settings = self.configuration()
         adjust = settings != self.settings
         self.settings = settings
-        background, target, workers = settings
+        mode, target, workers = settings
         if self.clock() >= self.next_sample:
             self.next_sample = self.clock() + 2
             self.cpu, self.available = self.sample()
@@ -35,7 +36,7 @@ class BackgroundLimit:
             self.capacity = 0
             self.job['wait_reason'] = 'メモリの空きを待機中'
             return 0
-        if not background:
+        if mode != 'cpu':
             self.capacity = workers
             self.job['wait_reason'] = ''
             return workers

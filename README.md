@@ -47,7 +47,9 @@ Restart ComfyUI and reload the browser. Open the sidebar image icon labeled **�
 
 Compression replaces the PNG after verification, without a confirmation dialog. The filename changes to WebP. Try a copied folder first to check compatibility with your own downstream tools.
 
-**CPU目標** is a target for overall CPU usage, not a strict cap. **全速** removes CPU throttling; memory and disk-space checks still apply. Images already processing finish before a pause takes effect.
+**通常** (Normal) is the default: use the selected concurrency and let the OS schedule CPU time. **他作業優先** (Prefer other work) keeps that concurrency but starts Windows codec child processes below normal priority; this does not change ComfyUI itself and currently has no priority effect on the Pillow backend on other platforms. **CPU目標** explicitly enables the optional overall CPU target controller, with normal process priority. Memory and disk-space checks apply in every mode. Priority changes apply to the next image; in-flight images finish before a pause takes effect.
+
+Explicitly saved CPU targets from older versions are preserved; select Normal to stop CPU-based throttling. The old Full-speed option becomes Normal. An implicit old 70% default is not retained as a CPU restriction.
 
 ## What “lossless” means here
 

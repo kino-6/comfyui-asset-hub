@@ -296,8 +296,8 @@ async def performance_setting(request):
     try:
         data = await request.json()
         if 'cpu_target' not in data:
-            raise ValueError('CPU目標は10〜95%、全速はnullで指定してください。')
-        return web.json_response(await job_manager.set_performance(data['cpu_target'], data.get('workers')))
+            raise ValueError('CPU目標は10〜95%、指定しない場合はnullで指定してください。')
+        return web.json_response(await job_manager.set_performance(data['cpu_target'], data.get('workers'), data.get('mode')))
     except ValueError as error:
         return web.json_response(dict(error=str(error)), status=400)
 

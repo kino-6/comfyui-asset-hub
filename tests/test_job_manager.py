@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+import native_webp
 
 from job_manager import JobManager
 from job_store import JobStore
@@ -34,6 +35,25 @@ class ControlledStorage:
 
 
 class JobManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_only_other_work_mode_lowers_codec_priority_and_modes_persist(self):
+        priorities = []
+        original = self.store.discard
+        def capture(key):
+            priorities.append(getattr(native_webp._priority, 'background', False))
+            return original(key)
+        self.store.discard = capture
+        for mode, target in [('background', None), ('normal', None), ('cpu', 90)]:
+            await self.manager.set_performance(target, 1, mode)
+            job = await self.manager.start('discard', [mode], workers=1)
+            await self.drain()
+            self.assertEqual(job['mode'], mode)
+            self.assertEqual(self.journal.performance()['mode'], mode)
+        self.assertEqual(priorities, [True, False, False])
+        for mode, target in [('bad', None), ('cpu', None), ('normal', 70), ('background', 70)]:
+            with self.assertRaises(ValueError):
+                await self.manager.set_performance(target, 1, mode)
+        self.assertEqual(self.journal.performance()['mode'], 'cpu')
+
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -70,7 +90,7 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
         for job in (first, second):
             self.assertEqual(self.journal.get(job['id'])['status'], 'done')
         self.assertEqual(self.manager.snapshot()['queue'], [])
-        self.assertEqual(self.journal.performance(), {'cpu_target': None, 'workers': 1})
+        self.assertEqual(self.journal.performance(), {'mode': 'normal', 'cpu_target': None, 'workers': 1})
 
     async def test_pause_finishes_inflight_and_resume_preserves_completed_count(self):
         first = await self.hold()
@@ -110,7 +130,7 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
                 await self.manager.set_performance(target, workers)
         with self.assertRaises(ValueError):
             await self.manager.set_background('yes')
-        self.assertEqual(self.journal.performance(), {'cpu_target': None, 'workers': 1})
+        self.assertEqual(self.journal.performance(), {'mode': 'normal', 'cpu_target': None, 'workers': 1})
         await self.manager.set_background(True)
         self.assertTrue(self.manager.snapshot()['background'])
         await self.manager.set_background(False)
@@ -129,4 +149,4 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.journal.compression(), 'speed')
         await recovered.set_compression('size')
         self.assertEqual(self.journal.compression(), 'size')
-        self.assertEqual(self.journal.performance(), {'cpu_target': None, 'workers': 1})
+        self.assertEqual(self.journal.performance(), {'mode': 'normal', 'cpu_target': None, 'workers': 1})

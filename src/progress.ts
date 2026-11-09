@@ -30,7 +30,7 @@ export interface HubStatus {
  job:JobState|null;
  queue:JobState[];
  attention:number;
- performance:{cpu_target:number|null;workers:number};
+ performance:{mode?:'normal'|'background'|'cpu';cpu_target:number|null;workers:number};
 }
 
 export const actionLabels:Record<string,string> = {

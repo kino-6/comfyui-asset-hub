@@ -100,7 +100,8 @@ async function createHub(){
   workerSelect.disabled=cpuSelect.disabled=true;
   const savePerformance=async()=>{
    performanceRevision++;savingPerformance=true;concurrency=Number(workerSelect.value);workerSelect.disabled=cpuSelect.disabled=true;
-   try{const value=await api('performance',{cpu_target:cpuSelect.value==='full'?null:Number(cpuSelect.value),workers:Number(workerSelect.value)});concurrency=value.workers;notice('');}
+   const mode=['normal','background'].includes(cpuSelect.value)?cpuSelect.value:'cpu';
+   try{const value=await api('performance',{mode,cpu_target:mode==='cpu'?Number(cpuSelect.value):null,workers:Number(workerSelect.value)});concurrency=value.workers;notice('');}
    catch(e){notice(e);}
    finally{savingPerformance=false;schedulePoll();}
   };
@@ -195,7 +196,8 @@ async function createHub(){
     }
     if(firstStatus){lastJob=job?.id||'';firstStatus=false;}
     if(revision===performanceRevision&&!savingPerformance){
-     const target=state.performance.cpu_target===null?'full':String(state.performance.cpu_target);
+     const mode=state.performance.mode||(state.performance.cpu_target===null?'normal':'cpu');
+     const target=mode==='cpu'?String(state.performance.cpu_target):mode;
      concurrency=running?job.workers:state.performance.workers;
      if(!Array.from(cpuSelect.options).some(o=>o.value===target))cpuSelect.add(new Option(`CPU目標 ${target}%`,target));
      if(!Array.from(workerSelect.options).some(o=>o.value===String(concurrency)))workerSelect.add(new Option(`${concurrency}並列`,String(concurrency)));

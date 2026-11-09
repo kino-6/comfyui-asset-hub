@@ -80,7 +80,7 @@ try{
  await page.waitForFunction(()=>document.querySelector('[data-progress]')?.textContent.includes('速度計測中'));
  // A control change requests another poll while the preceding request is live.
  for(let i=0;i<60&&!activePolls;i++)await page.waitForTimeout(50);
- await page.getByLabel('CPU目標',{exact:true}).selectOption('50');
+ await page.getByLabel('処理モード',{exact:true}).selectOption('50');
  await page.waitForFunction(()=>/直近 (0\.[89]|1\.[012])枚\/秒/.test(document.querySelector('[data-progress]')?.textContent||''),{},{timeout:20000});
  check('long-running job displays recent throughput instead of historical 0.4/s',true);
  check('slow progress requests remain single-flight and use lightweight endpoint',maxPolls===1&&lightPolls>=3);

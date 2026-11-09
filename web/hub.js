@@ -5888,9 +5888,10 @@ var ProgressPanel = class {
   constructor(parent, actions) {
     this.element.className = "ah-toolbar";
     this.element.innerHTML = `
-   <select data-cpu-target aria-label="CPU\u76EE\u6A19" title="PC\u5168\u4F53\u306ECPU\u4F7F\u7528\u7387\u306E\u76EE\u5B89\u3002\u753B\u50CF\u751F\u6210\u4E2D\u3082CPU\u30FB\u30E1\u30E2\u30EA\u306E\u4F59\u88D5\u306B\u5FDC\u3058\u3066\u5727\u7E2E\u3092\u7D9A\u3051\u307E\u3059\u3002\u5168\u901F\u306FCPU\u8ABF\u6574\u3092\u89E3\u9664\u3057\u307E\u3059\u3002\u5909\u66F4\u306F\u51E6\u7406\u4E2D\u306B\u3082\u53CD\u6620\u3057\u307E\u3059\u3002">
+   <select data-cpu-target aria-label="\u51E6\u7406\u30E2\u30FC\u30C9" title="\u901A\u5E38\uFF1A\u6307\u5B9A\u4E26\u5217\u6570\u3067\u5B9F\u884C\u3002\u4ED6\u4F5C\u696D\u512A\u5148\uFF1A\u6307\u5B9A\u4E26\u5217\u6570\u306E\u307E\u307E\u5727\u7E2E\u5B50\u30D7\u30ED\u30BB\u30B9\u3092\u4F4E\u512A\u5148\u5EA6\u306B\u3057\u307E\u3059\uFF08Windows\u3001\u6B21\u306E\u753B\u50CF\u304B\u3089\uFF09\u3002CPU\u76EE\u6A19\u6307\u5B9A\u6642\u3060\u3051\u4E26\u5217\u6570\u3092\u81EA\u52D5\u8ABF\u6574\u3057\u307E\u3059\u3002">
+    <option value="normal" selected>\u901A\u5E38</option><option value="background">\u4ED6\u4F5C\u696D\u512A\u5148</option>
     <option value="30">CPU\u76EE\u6A19 30%</option><option value="50">CPU\u76EE\u6A19 50%</option>
-    <option value="70" selected>CPU\u76EE\u6A19 70%</option><option value="90">CPU\u76EE\u6A19 90%</option><option value="full">\u5168\u901F</option>
+    <option value="70">CPU\u76EE\u6A19 70%</option><option value="90">CPU\u76EE\u6A19 90%</option>
    </select>
    <span data-cpu-current class="ah-detail" title="PC\u5168\u4F53\u306E\u5B9F\u6E2CCPU\u4F7F\u7528\u7387\u30022\u79D2\u9593\u9694\u3067\u53D6\u5F97\u3057\u307E\u3059\u3002"></span>
    <span data-total-progress class="ah-total-meter" hidden>\u5168\u4F53<progress class="ah-run-meter" aria-label="\u5168\u4F53\u306E\u51E6\u7406\u9032\u6357" max="1" value="0" hidden></progress></span>
@@ -6170,8 +6171,9 @@ async function createHub() {
       savingPerformance = true;
       concurrency = Number(workerSelect.value);
       workerSelect.disabled = cpuSelect.disabled = true;
+      const mode = ["normal", "background"].includes(cpuSelect.value) ? cpuSelect.value : "cpu";
       try {
-        const value = await api("performance", { cpu_target: cpuSelect.value === "full" ? null : Number(cpuSelect.value), workers: Number(workerSelect.value) });
+        const value = await api("performance", { mode, cpu_target: mode === "cpu" ? Number(cpuSelect.value) : null, workers: Number(workerSelect.value) });
         concurrency = value.workers;
         notice("");
       } catch (e) {
@@ -6394,7 +6396,8 @@ async function createHub() {
           firstStatus = false;
         }
         if (revision === performanceRevision && !savingPerformance) {
-          const target = state.performance.cpu_target === null ? "full" : String(state.performance.cpu_target);
+          const mode = state.performance.mode || (state.performance.cpu_target === null ? "normal" : "cpu");
+          const target = mode === "cpu" ? String(state.performance.cpu_target) : mode;
           concurrency = running ? job.workers : state.performance.workers;
           if (!Array.from(cpuSelect.options).some((o) => o.value === target)) cpuSelect.add(new Option(`CPU\u76EE\u6A19 ${target}%`, target));
           if (!Array.from(workerSelect.options).some((o) => o.value === String(concurrency))) workerSelect.add(new Option(`${concurrency}\u4E26\u5217`, String(concurrency)));

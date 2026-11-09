@@ -105,22 +105,28 @@ class JobManager:
             await asyncio.to_thread(self.journal.set_background, enabled)
             self.background = enabled
             self.performance.update(await asyncio.to_thread(self.journal.performance))
-            if self.current:
-                self.current.update(background=enabled, cpu_target=self._cpu_target())
+            active = [self.current] if self.current and self.worker_active else []
+            for job in active + self.pending:
+                job.update(background=enabled, mode=self.performance['mode'], cpu_target=self._cpu_target())
         return dict(enabled=self.background)
 
-    async def set_performance(self, target, workers):
+    async def set_performance(self, target, workers, mode=None):
+        mode = mode if mode is not None else ('cpu' if target is not None else 'normal')
+        if mode not in ('normal', 'background', 'cpu'):
+            raise ValueError('処理モードが不正です。')
+        if (mode == 'cpu') != (target is not None):
+            raise ValueError('CPU目標はCPU目標指定モードだけで指定してください。')
         if target is not None and (type(target) is not int or not 10 <= target <= 95):
-            raise ValueError('CPU目標は10〜95%、全速はnullで指定してください。')
+            raise ValueError('CPU目標は10〜95%、指定しない場合はnullで指定してください。')
         if type(workers) is not int or not 1 <= workers <= 16:
             raise ValueError('並列数は1〜16で指定してください。')
         async with self.settings_lock:
-            await asyncio.to_thread(self.journal.set_performance, target, workers)
-            self.performance.update(cpu_target=target, workers=workers)
-            self.background = target is not None
+            await asyncio.to_thread(self.journal.set_performance, target, workers, mode)
+            self.performance.update(mode=mode, cpu_target=target, workers=workers)
+            self.background = mode == 'cpu'
             active = [self.current] if self.current and self.worker_active else []
             for job in active + self.pending:
-                job.update(background=self.background, cpu_target=self._cpu_target(), workers=workers)
+                job.update(background=self.background, mode=mode, cpu_target=self._cpu_target(), workers=workers)
         return dict(self.performance)
 
     def _cpu_target(self):
@@ -136,7 +142,7 @@ class JobManager:
     async def _activate(self, job):
         self.current = job
         self.worker_active = True
-        job.update(status='running', background=self.background, cpu_target=self._cpu_target())
+        job.update(status='running', background=self.background, mode=self.performance['mode'], cpu_target=self._cpu_target())
         self.cancel.clear()
         try:
             await asyncio.to_thread(self.journal.state, job['id'], 'running')
@@ -152,7 +158,7 @@ class JobManager:
             # An earlier queued job may already have replaced this PNG.
             if Path(self.store.resolve(item)).exists():
                 raise ValueError('待機中に原本が変更されました。確認後に失敗分を再試行してください。')
-        with background_priority(job['background']):
+        with background_priority(job['mode'] == 'background'):
             return self.store.public(getattr(self.store, job['action'])(item))
 
     def _work(self, job):

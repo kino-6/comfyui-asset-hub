@@ -45,29 +45,32 @@ class JobStore:
             db.commit()
 
     def background(self):
-        with closing(self.connect()) as db:
-            row = db.execute("SELECT value FROM settings WHERE key='background'").fetchone()
-        return json.loads(row[0]) if row else True
+        # Legacy API flag means CPU target control, not process priority.
+        return self.performance()['mode'] == 'cpu'
 
     def set_background(self, enabled):
         with closing(self.connect()) as db:
-            db.execute("INSERT OR REPLACE INTO settings VALUES ('background',?)", (json.dumps(enabled),))
-            db.execute("UPDATE jobs SET background=? WHERE status IN ('running','queued')", (int(enabled),))
-            db.commit()
+            row = db.execute("SELECT value FROM settings WHERE key='cpu_target'").fetchone()
+        self.set_performance((json.loads(row[0]) if row else 70) if enabled else None,
+                             self.performance()['workers'])
 
     def performance(self):
         with closing(self.connect()) as db:
             values = {key: json.loads(value) for key, value in db.execute('SELECT key,value FROM settings')}
-        return dict(cpu_target=values.get('cpu_target', 70) if values.get('background', True) else None,
+        # Retain explicitly saved legacy targets, but do not migrate the old
+        # implicit 70% default into a new, unwanted CPU restriction.
+        mode = values.get('mode', 'cpu' if 'cpu_target' in values and values.get('background', True) else 'normal')
+        return dict(mode=mode, cpu_target=values.get('cpu_target', 70) if mode == 'cpu' else None,
                     workers=values.get('workers', 4))
 
-    def set_performance(self, target, workers):
+    def set_performance(self, target, workers, mode=None):
+        mode = mode if mode is not None else ('cpu' if target is not None else 'normal')
         with closing(self.connect()) as db:
-            values = [('background', target is not None), ('workers', workers)]
+            values = [('mode', mode), ('background', mode == 'cpu'), ('workers', workers)]
             if target is not None:
                 values.append(('cpu_target', target))
             db.executemany('INSERT OR REPLACE INTO settings VALUES (?,?)', [(key, json.dumps(value)) for key, value in values])
-            db.execute("UPDATE jobs SET background=?,workers=? WHERE status IN ('running','queued')", (int(target is not None), workers))
+            db.execute("UPDATE jobs SET background=?,workers=? WHERE status IN ('running','queued')", (int(mode == 'cpu'), workers))
             db.commit()
 
     def create(self, action, items, workers, background, fingerprint, label=None):

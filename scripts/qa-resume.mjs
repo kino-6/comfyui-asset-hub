@@ -45,8 +45,8 @@ try{
  page.on('pageerror',e=>report.pageErrors.push(e.message));
  await page.route('**/*',r=>['127.0.0.1','localhost'].includes(new URL(r.request().url()).hostname)?r.continue():r.abort());
  await open();
- check('CPU target is visible and defaults to 70 percent',await page.getByLabel('CPU目標').inputValue()==='70');
- await page.getByLabel('CPU目標').selectOption('full');await until(async()=>!(await json('/asset_hub/status')).background);
+ check('normal mode is the default',await page.getByLabel('処理モード').inputValue()==='normal');
+ await page.getByLabel('処理モード').selectOption('normal');await until(async()=>!(await json('/asset_hub/status')).background);
  check('background control reaches the server',true);
  const errors=await json('/asset_hub/prepare',{archive:true,workers:4,items:[item('good.png'),...Array.from({length:25},(_,i)=>item(`bad-${String(i).padStart(2,'0')}.png`))]});
  const failed=await done(errors.id);check('all 25 failures are counted beyond previous 20-entry limit',failed.error_count===25&&failed.succeeded===1);
@@ -119,7 +119,7 @@ old.unlink()
  const resumedQueue=await history(queued.id);
  check('resumed stale PNG entry safely skips an already converted file',resumedQueue.skipped===1&&(await json('/asset_hub/status')).total===completedCount);
  check('changed queued source is rejected and retained',resumedQueue.error_count===1&&resumedQueue.errors[0].error.includes('原本が変更')&&(await fs.readFile(path.join(output,'changed.png'))).subarray(-20).toString()==='changed while paused');
- await page.getByLabel('CPU目標').selectOption('70');await until(async()=>(await json('/asset_hub/status')).background);
+ await page.getByLabel('処理モード').selectOption('70');await until(async()=>(await json('/asset_hub/status')).background);
  check('background mode can be re-enabled',true);
  await page.screenshot({path:path.join(out,'finished.png')});
  check('no browser exceptions',report.pageErrors.length===0);
