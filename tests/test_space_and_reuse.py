@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from PIL import Image
+from PIL import PngImagePlugin
 
 from disk_space import DiskReservations, requirements, volume, png_budget
 from job_store import JobStore
@@ -18,6 +19,59 @@ import native_webp
 
 
 class ReuseTests(unittest.TestCase):
+    def test_preflight_snapshot_avoids_second_read_and_restores_pixels_and_metadata(self):
+        info = PngImagePlugin.PngInfo()
+        info.add_text('workflow', '{"nodes":[],"links":[]}')
+        Image.new('RGBA', (256, 256), (12, 34, 56, 0)).save(self.source, pnginfo=info, compress_level=0)
+        task = {}
+        expected = requirements(self.store, 'archive', self.item)
+        self.assertEqual(requirements(self.store, 'archive', self.item, task), expected)
+        snapshot = task.pop('_input_snapshot')
+        self.assertEqual(snapshot['data'], self.source.read_bytes())
+        with self.store.prepared_input(snapshot), patch.object(Path, 'read_bytes', side_effect=AssertionError('must reuse preflight bytes')):
+            record = self.store.archive(self.item)
+        self.assertNotIn('data', snapshot)
+        self.store.restore(record['id'])
+        with Image.open(self.source) as restored:
+            self.assertEqual(restored.tobytes(), bytes((12, 34, 56, 0)) * (256 * 256))
+            self.assertEqual(restored.info['workflow'], '{"nodes":[],"links":[]}')
+
+    def test_snapshot_rejects_changed_source_and_releases_data_on_failure(self):
+        task = {}
+        requirements(self.store, 'archive', self.item, task)
+        snapshot = task.pop('_input_snapshot')
+        Image.new('RGB', (9, 9), '#445566').save(self.source)
+        changed = self.source.read_bytes()
+        with self.assertRaisesRegex(ValueError, '見積もり後'), self.store.prepared_input(snapshot):
+            self.store.archive(self.item)
+        self.assertEqual(self.source.read_bytes(), changed)
+        self.assertNotIn('data', snapshot)
+        self.assertEqual(list(self.store.stage.iterdir()), [])
+
+    def test_snapshot_keeps_post_encode_source_hash_check(self):
+        task = {}
+        Image.new('RGB', (256, 256)).save(self.source, compress_level=0)
+        requirements(self.store, 'archive', self.item, task)
+        snapshot = task.pop('_input_snapshot')
+        import storage
+        real_digest = storage.digest
+        def modify_before_check(path):
+            if Path(path) == self.source:
+                self.source.write_bytes(b'changed during compression')
+            return real_digest(path)
+        with self.assertRaisesRegex(ValueError, '原本が更新'), self.store.prepared_input(snapshot), patch('storage.digest', side_effect=modify_before_check):
+            self.store.archive(self.item)
+        self.assertEqual(self.source.read_bytes(), b'changed during compression')
+        self.assertEqual(list(self.store.stage.iterdir()), [])
+        self.assertNotIn('data', snapshot)
+
+    def test_snapshot_limit_keeps_streaming_fallback(self):
+        task = {}
+        with patch('storage.INPUT_SNAPSHOT_LIMIT', 8):
+            self.assertTrue(requirements(self.store, 'archive', self.item, task))
+        self.assertNotIn('_input_snapshot', task)
+        self.assertIsInstance(self.store.archive(self.item), dict)
+
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)

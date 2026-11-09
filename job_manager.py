@@ -6,6 +6,7 @@ This manager owns the current job, queue, cancellation and live settings.
 import asyncio
 from pathlib import Path
 import threading
+from contextlib import nullcontext
 
 if __package__:
     from .background import BackgroundLimit
@@ -154,15 +155,17 @@ class JobManager:
 
     def _process(self, job, task):
         item = task['value']
-        if isinstance(item, dict) and self.fingerprint(item) != task['fingerprint']:
-            # An earlier queued job may already have replaced this PNG.
-            if Path(self.store.resolve(item)).exists():
-                raise ValueError('待機中に原本が変更されました。確認後に失敗分を再試行してください。')
-        with background_priority(job['mode'] == 'background'):
-            return self.store.public(getattr(self.store, job['action'])(item))
+        snapshot = task.pop('_input_snapshot', None)
+        with self.store.prepared_input(snapshot) if snapshot else nullcontext():
+            if isinstance(item, dict) and self.fingerprint(item) != task['fingerprint']:
+                # An earlier queued job may already have replaced this PNG.
+                if Path(self.store.resolve(item)).exists():
+                    raise ValueError('待機中に原本が変更されました。確認後に失敗分を再試行してください。')
+            with background_priority(job['mode'] == 'background'):
+                return self.store.public(getattr(self.store, job['action'])(item))
 
     def _work(self, job):
-        disk = DiskReservations(lambda task: requirements(self.store, job['action'], task['value']))
+        disk = DiskReservations(lambda task: requirements(self.store, job['action'], task['value'], prepared_task=task))
         run_parallel(
             job, self.journal.items(job['id']), lambda task: self._process(job, task),
             self.cancel, job['workers'], limit=BackgroundLimit(job), admission=disk,

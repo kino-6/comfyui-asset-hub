@@ -1,6 +1,7 @@
 """Reserve estimated temporary space per filesystem before admitting an image."""
 import ctypes
 import hashlib
+import io
 from ctypes import wintypes
 from pathlib import Path
 import os
@@ -35,23 +36,23 @@ def volume(path):
     return key.casefold(), path
 
 
-def png_budget(path):
+def png_budget(path, data=None):
     """Read dimensions/metadata without decoding pixels or seeking per PNG chunk.
 
     Small read/seek pairs serialize admission and are costly on slower volumes.
     Consume IDAT in bounded, sequential buffers so the OS can read ahead.
     """
-    with Image.open(path) as image:
+    with Image.open(io.BytesIO(data) if data is not None else path) as image:
         width, height = image.size
         if image.format != 'PNG' or image.mode not in ('RGB', 'RGBA') or max(width, height) > 16383:
             raise ValueError('圧縮対象外の画像です。')
         metadata = sum(len(value.encode('utf-8')) if isinstance(value, str) else len(value) if isinstance(value, bytes) else 0
                        for value in image.info.values())
     ancillary = 0
-    with open(path, 'rb', buffering=PNG_SCAN_BUFFER) as stream:
+    with (io.BytesIO(data) if data is not None else open(path, 'rb', buffering=PNG_SCAN_BUFFER)) as stream:
         if stream.read(8) != b'\x89PNG\r\n\x1a\n':
             raise ValueError('PNGではありません。')
-        length = os.fstat(stream.fileno()).st_size
+        length = len(data) if data is not None else os.fstat(stream.fileno()).st_size
         position = 8
         while position + 12 <= length:
             header = stream.read(8)
@@ -66,8 +67,8 @@ def png_budget(path):
             if header[4:] == b'IHDR':
                 if count != 13:
                     raise ValueError('圧縮対象外の画像です。')
-                data = stream.read(count)
-                if len(data) != 13 or data[8] != 8 or data[9] not in (2, 6):
+                ihdr = stream.read(count)
+                if len(ihdr) != 13 or ihdr[8] != 8 or ihdr[9] not in (2, 6):
                     raise ValueError('圧縮対象外の画像です。')
                 remaining = 4
             else:
@@ -87,7 +88,7 @@ def png_budget(path):
     return int(width * height * 4 * 1.1) + metadata, metadata
 
 
-def requirements(store, action, item):
+def requirements(store, action, item, prepared_task=None):
     if action == 'discard':
         return []
     if isinstance(item, dict):
@@ -103,9 +104,12 @@ def requirements(store, action, item):
                 if hashlib.file_digest(stream, 'sha256').hexdigest() == record['source_hash']:
                     return []
         try:
-            candidate, metadata = png_budget(source)
+            snapshot = store.read_input_snapshot(source) if prepared_task is not None else None
+            candidate, metadata = png_budget(source, snapshot['data'] if snapshot else None)
         except (OSError, ValueError, SyntaxError):
             return []  # Invalid images fail without creating an output file.
+        if snapshot:
+            prepared_task['_input_snapshot'] = snapshot
         # The metadata record and SQLite journal can coexist with the candidate.
         plan = [(store.stage, candidate + 2 * metadata)]
         if action == 'archive':

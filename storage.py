@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
-from contextlib import closing
+from contextlib import closing, contextmanager
 from functools import wraps
 import struct
 import threading
@@ -36,6 +36,9 @@ def digest(path):
 def file_stamp(path):
     stat = path.stat()
     return [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
+
+
+INPUT_SNAPSHOT_LIMIT = 64 * 1024 * 1024
 
 
 def png_chunks(data):
@@ -277,6 +280,28 @@ class Storage:
             item['name'] = r['target_name']
         return Path(self.resolve(item))
 
+    def read_input_snapshot(self, source):
+        """Bound preflight's extra buffer; larger PNGs retain the streaming path."""
+        stamp = file_stamp(source)
+        if stamp[2] > INPUT_SNAPSHOT_LIMIT:
+            return None
+        with source.open('rb') as stream:
+            data = stream.read(stamp[2] + 1)
+        if file_stamp(source) != stamp or len(data) != stamp[2]:
+            raise ValueError('読込中に原本が更新されました。原本を保持します。')
+        return dict(path=os.path.normcase(str(source.resolve())), stamp=stamp, data=data)
+
+    @contextmanager
+    def prepared_input(self, snapshot):
+        previous = getattr(self._encoding_context, 'input_snapshot', None)
+        self._encoding_context.input_snapshot = snapshot
+        try:
+            yield
+        finally:
+            self._encoding_context.input_snapshot = previous
+            # Also release unused data when an existing archive is reused.
+            snapshot.pop('data', None)
+
     @asset_locked
     def archive(self, item):
         for record in self.for_items([item]):
@@ -308,7 +333,14 @@ class Storage:
             raise ValueError('圧縮候補を作れるのはPNGです。')
         source_stamp = file_stamp(source)
         report('読込中')
-        data = source.read_bytes()
+        snapshot = getattr(self._encoding_context, 'input_snapshot', None)
+        self._encoding_context.input_snapshot = None
+        if snapshot:
+            if snapshot['path'] != os.path.normcase(str(source.resolve())) or snapshot['stamp'] != source_stamp:
+                raise ValueError('見積もり後に原本が更新されました。原本を保持します。')
+            data = snapshot.pop('data')
+        else:
+            data = source.read_bytes()
         source_hash = hashlib.sha256(data).hexdigest()
         with closing(sqlite3.connect(self.index)) as db:
             existing = db.execute("SELECT payload FROM records WHERE item=? AND source_hash=? AND state IN ('prepared','placing')", (json.dumps(item, sort_keys=True), source_hash)).fetchall()
